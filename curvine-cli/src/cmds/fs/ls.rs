@@ -1,9 +1,9 @@
 use clap::Subcommand;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::{CurvineURI, FileSystem};
-use curvine_common::state::FileStatus;
-use orpc::common::{ByteUnit, DurationUnit};
-use orpc::CommonResult;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::{CurvineURI, FileSystem};
+use curvine_model::FileStatus;
+use curvine_runtime::common::{ByteUnit, DurationUnit};
+use curvine_unified_fs::UnifiedFileSystem;
 
 /// Configuration for printing file entries
 #[derive(Debug)]
@@ -139,9 +139,10 @@ impl LsCommand {
                     return Ok(());
                 }
 
-                // Print header
+                // Print header. The entries below go to stdout, so the summary must
+                // not: a piped `ls` would otherwise see it as another entry.
                 if !*recursive {
-                    println!("Found {} items", files.len());
+                    let _ = write_listing_summary(files.len(), &mut std::io::stderr());
                 }
 
                 // Calculate column widths for formatting
@@ -320,46 +321,22 @@ async fn print_file_entry(
     config: &PrintConfig,
 ) -> CommonResult<()> {
     let file_type = if file.is_dir { "d" } else { "-" };
-    let mut mode = file.mode & 0o777;
-    let mut permissions = String::new();
-    while mode > 0 {
-        if mode & 0o1 != 0 {
-            permissions.insert(0, 'x');
-        } else {
-            permissions.insert(0, '-');
-        }
-        if mode & 0o2 != 0 {
-            permissions.insert(0, 'w');
-        } else {
-            permissions.insert(0, '-');
-        }
-        if mode & 0o4 != 0 {
-            permissions.insert(0, 'r');
-        } else {
-            permissions.insert(0, '-');
-        }
-        mode >>= 3;
-    }
+    let permissions = crate::cmds::fs::common::format_permission(file.mode);
     let replicas = if file.is_dir {
         "-"
     } else {
         &file.replicas.to_string()
     };
-    let mut owner = file.owner.to_string(); // Default owner
-    let mut group = file.group.to_string(); // Default group
-    if owner.is_empty() || group.is_empty() {
-        // Fallback to default values if owner/group is empty
-        let uid = orpc::sys::get_uid();
-        let gid = orpc::sys::get_gid();
-        let default_owner = orpc::sys::get_username_by_uid(uid);
-        let default_group = orpc::sys::get_groupname_by_gid(gid);
-        if owner.is_empty() {
-            owner = default_owner.unwrap_or_else(|| "root".to_string());
-        }
-        if group.is_empty() {
-            group = default_group.unwrap_or_else(|| "root".to_string());
-        }
-    }
+    let owner = if file.owner.is_empty() {
+        "-"
+    } else {
+        file.owner.as_str()
+    };
+    let group = if file.group.is_empty() {
+        "-"
+    } else {
+        file.group.as_str()
+    };
 
     // Format file size
     let size = if file.is_dir {
@@ -416,4 +393,23 @@ async fn print_file_entry(
     }
 
     Ok(())
+}
+
+/// Writes the informational summary line for a listing to `out`.
+///
+/// `execute` hands this `stderr`, keeping stdout a plain list of entries.
+fn write_listing_summary(items: usize, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(out, "Found {} items", items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_listing_summary;
+
+    #[test]
+    fn summary_reports_the_number_of_listed_entries() {
+        let mut written = Vec::new();
+        write_listing_summary(3, &mut written).expect("write summary");
+        assert_eq!(String::from_utf8(written).unwrap(), "Found 3 items\n");
+    }
 }

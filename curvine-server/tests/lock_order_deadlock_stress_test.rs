@@ -1,11 +1,12 @@
-use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
-use curvine_common::state::{
+use curvine_config::{ClusterConf, MasterConf};
+use curvine_model::{
     BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, StorageType, WorkerInfo,
 };
+use curvine_raft::conf::JournalConf;
+use curvine_runtime::common::Utils;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::Master;
-use orpc::common::Utils;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc,
@@ -67,6 +68,7 @@ fn stress_add_block_vs_block_report_no_hang() {
         for i in 0..loops {
             let res = fs_a.add_block(
                 "/deadlock/file.log",
+                None,
                 client.clone(),
                 vec![],
                 vec![],
@@ -95,6 +97,8 @@ fn stress_add_block_vs_block_report_no_hang() {
         let mut err = 0usize;
         for i in 0..loops {
             let report = BlockReportList {
+                report_id: 0,
+                batch_index: None,
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: false,
@@ -107,7 +111,7 @@ fn stress_add_block_vs_block_report_no_hang() {
                 )],
             };
 
-            let res = fs_b.block_report(report);
+            let res = fs_b.block_report(report, None);
             if res.is_ok() {
                 ok += 1;
             } else {
@@ -167,6 +171,7 @@ fn sanity_single_thread_paths_progress() {
     for i in 0..500 {
         let _ = fs.add_block(
             "/deadlock/file.log",
+            None,
             client.clone(),
             vec![],
             vec![],
@@ -174,6 +179,8 @@ fn sanity_single_thread_paths_progress() {
             None,
         );
         let report = BlockReportList {
+            report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -185,6 +192,6 @@ fn sanity_single_thread_paths_progress() {
                 0,
             )],
         };
-        let _ = fs.block_report(report);
+        let _ = fs.block_report(report, None);
     }
 }

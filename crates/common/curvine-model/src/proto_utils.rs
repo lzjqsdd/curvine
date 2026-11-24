@@ -1,0 +1,1181 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::proto::*;
+use crate::state::*;
+use crate::worker_info::TransferWorkerCapabilities;
+use curvine_core_error::{try_err, CommonResult};
+use curvine_sys::version::ComponentVersion;
+use prost::bytes::BytesMut;
+use prost::Message;
+use std::fmt::Debug;
+
+pub struct ProtoUtils;
+
+impl ProtoUtils {
+    pub fn storage_info_to_pb(item: StorageInfo) -> StorageInfoProto {
+        StorageInfoProto {
+            dir_id: item.dir_id,
+            storage_id: item.storage_id,
+            failed: item.failed,
+            capacity: item.capacity,
+            fs_used: item.fs_used,
+            non_fs_used: item.non_fs_used,
+            available: item.available,
+            reserved_bytes: item.reserved_bytes,
+            storage_type: item.storage_type.into(),
+            block_num: item.block_num,
+            dir_path: item.dir_path,
+        }
+    }
+
+    pub fn storage_info_from_pb(item: StorageInfoProto) -> StorageInfo {
+        StorageInfo {
+            dir_id: item.dir_id,
+            storage_id: item.storage_id,
+            failed: item.failed,
+            capacity: item.capacity,
+            fs_used: item.fs_used,
+            non_fs_used: item.non_fs_used,
+            available: item.available,
+            reserved_bytes: item.reserved_bytes,
+            storage_type: StorageType::from(item.storage_type),
+            block_num: item.block_num,
+            dir_path: item.dir_path,
+        }
+    }
+
+    pub fn worker_address_to_pb(addr: &WorkerAddress) -> WorkerAddressProto {
+        WorkerAddressProto {
+            worker_id: addr.worker_id.to_owned(),
+            hostname: addr.hostname.to_owned(),
+            ip_addr: addr.ip_addr.to_owned(),
+            rpc_port: addr.rpc_port,
+            web_port: addr.web_port,
+        }
+    }
+
+    pub fn worker_address_from_pb(addr: &WorkerAddressProto) -> WorkerAddress {
+        WorkerAddress {
+            worker_id: addr.worker_id.to_owned(),
+            hostname: addr.hostname.to_owned(),
+            ip_addr: addr.ip_addr.to_owned(),
+            rpc_port: addr.rpc_port,
+            web_port: addr.web_port,
+        }
+    }
+
+    pub fn storage_info_list_from_pb(list: Vec<StorageInfoProto>) -> Vec<StorageInfo> {
+        let mut res = Vec::with_capacity(list.len());
+        for item in list {
+            let info = Self::storage_info_from_pb(item);
+            res.push(info)
+        }
+
+        res
+    }
+
+    pub fn client_address_from_pb(addr: ClientAddressProto) -> ClientAddress {
+        ClientAddress {
+            client_name: addr.client_name,
+            hostname: addr.hostname,
+            ip_addr: addr.ip_addr,
+            port: addr.port,
+        }
+    }
+
+    pub fn client_address_to_pb(addr: ClientAddress) -> ClientAddressProto {
+        ClientAddressProto {
+            client_name: addr.client_name,
+            hostname: addr.hostname,
+            ip_addr: addr.ip_addr,
+            port: addr.port,
+        }
+    }
+
+    pub fn extend_block_from_pb(block: ExtendedBlockProto) -> ExtendedBlock {
+        ExtendedBlock {
+            id: block.id,
+            len: block.block_size,
+            storage_type: StorageType::from(block.storage_type),
+            file_type: FileType::from(block.file_type),
+            alloc_opts: block.alloc_opts.map(Self::file_alloc_opts_from_pb),
+        }
+    }
+
+    pub fn extend_block_to_pb(block: ExtendedBlock) -> ExtendedBlockProto {
+        ExtendedBlockProto {
+            id: block.id,
+            block_size: block.len,
+            storage_type: block.storage_type.into(),
+            file_type: block.file_type.into(),
+            alloc_opts: block.alloc_opts.map(Self::file_alloc_opts_to_pb),
+        }
+    }
+
+    pub fn block_location_from_pb(locations: BlockLocationProto) -> BlockLocation {
+        BlockLocation {
+            worker_id: locations.worker_id,
+            storage_type: StorageType::from(locations.storage_type),
+        }
+    }
+
+    pub fn block_location_to_pb(locations: BlockLocation) -> BlockLocationProto {
+        BlockLocationProto {
+            worker_id: locations.worker_id,
+            storage_type: locations.storage_type.into(),
+        }
+    }
+
+    pub fn commit_block_from_pb(block: CommitBlockProto) -> CommitBlock {
+        let mut locations = vec![];
+        for item in block.locations {
+            locations.push(Self::block_location_from_pb(item))
+        }
+
+        CommitBlock {
+            block_id: block.block_id,
+            block_len: block.block_len,
+            locations,
+        }
+    }
+
+    pub fn commit_block_to_pb(block: CommitBlock) -> CommitBlockProto {
+        let mut locations = vec![];
+        for item in block.locations {
+            locations.push(Self::block_location_to_pb(item))
+        }
+
+        CommitBlockProto {
+            block_id: block.block_id,
+            block_len: block.block_len,
+            locations,
+        }
+    }
+
+    pub fn located_block_to_pb(block: LocatedBlock) -> LocatedBlockProto {
+        let b = Self::extend_block_to_pb(block.block);
+
+        let locs: Vec<WorkerAddressProto> =
+            block.locs.iter().map(Self::worker_address_to_pb).collect();
+
+        LocatedBlockProto {
+            block: b,
+            offset: 0,
+            locs,
+            has_spdk: Some(block.has_spdk),
+        }
+    }
+
+    pub fn located_block_from_pb(block: LocatedBlockProto) -> LocatedBlock {
+        let locs = block
+            .locs
+            .iter()
+            .map(Self::worker_address_from_pb)
+            .collect();
+
+        LocatedBlock {
+            block: Self::extend_block_from_pb(block.block),
+            locs,
+            has_spdk: block.has_spdk.unwrap_or(false),
+        }
+    }
+
+    pub fn encode<T: Message + Debug>(proto: T) -> CommonResult<BytesMut> {
+        let mut bytes = BytesMut::with_capacity(proto.encoded_len());
+        try_err!(proto.encode(&mut bytes));
+        Ok(bytes)
+    }
+
+    pub fn storage_policy_to_pb(policy: StoragePolicy) -> StoragePolicyProto {
+        StoragePolicyProto {
+            storage_type: policy.storage_type.into(),
+            ttl_ms: policy.ttl_ms,
+            ttl_action: policy.ttl_action.into(),
+            ufs_mtime: policy.ufs_mtime,
+            state: policy.state as i32,
+        }
+    }
+
+    pub fn storage_policy_from_pb(policy: StoragePolicyProto) -> StoragePolicy {
+        StoragePolicy {
+            storage_type: StorageType::from(policy.storage_type),
+            ttl_ms: policy.ttl_ms,
+            ttl_action: TtlAction::from(policy.ttl_action),
+            ufs_mtime: policy.ufs_mtime,
+            state: StorageState::from(policy.state as i8),
+        }
+    }
+
+    pub fn file_status_to_pb(mut status: FileStatus) -> FileStatusProto {
+        let has_ctime = status.x_attr.contains_key(INTERNAL_CTIME_XATTR);
+        let ctime = status.ctime();
+        // NUL cannot appear in a client xattr name, so every such key is
+        // master-owned metadata (ctime, trash markers) and must not leak out.
+        status.x_attr.retain(|key, _| !key.starts_with('\0'));
+        FileStatusProto {
+            id: status.id,
+            path: status.path,
+            name: status.name,
+            is_dir: status.is_dir,
+            mtime: status.mtime,
+            atime: status.atime,
+            children_num: status.children_num,
+            is_complete: status.is_complete,
+            len: status.len,
+            replicas: status.replicas,
+            block_size: status.block_size,
+            file_type: status.file_type.into(),
+            x_attr: status.x_attr,
+            storage_policy: Self::storage_policy_to_pb(status.storage_policy),
+
+            owner: status.owner,
+            group: status.group,
+            mode: status.mode,
+            target: status.target,
+            nlink: status.nlink,
+            ctime: has_ctime.then_some(ctime),
+        }
+    }
+
+    pub fn file_status_from_pb(status: FileStatusProto) -> FileStatus {
+        let mut x_attr = status.x_attr;
+        if let Some(ctime) = status.ctime {
+            x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                ctime.to_le_bytes().to_vec(),
+            );
+        }
+        FileStatus {
+            id: status.id,
+            path: status.path,
+            name: status.name,
+            is_dir: status.is_dir,
+            mtime: status.mtime,
+            atime: status.atime,
+            children_num: status.children_num,
+            is_complete: status.is_complete,
+            len: status.len,
+            replicas: status.replicas,
+            block_size: status.block_size,
+            file_type: FileType::from(status.file_type),
+            x_attr,
+            storage_policy: Self::storage_policy_from_pb(status.storage_policy),
+            owner: status.owner,
+            group: status.group,
+            mode: status.mode,
+            nlink: status.nlink,
+            target: status.target,
+        }
+    }
+
+    pub fn file_blocks_to_pb(src: FileBlocks) -> FileBlocksProto {
+        let block_locs: Vec<LocatedBlockProto> = src
+            .block_locs
+            .into_iter()
+            .map(Self::located_block_to_pb)
+            .collect();
+
+        FileBlocksProto {
+            status: Self::file_status_to_pb(src.status),
+            block_locs,
+        }
+    }
+
+    pub fn file_blocks_from_pb(src: FileBlocksProto) -> FileBlocks {
+        let block_locs: Vec<LocatedBlock> = src
+            .block_locs
+            .into_iter()
+            .map(Self::located_block_from_pb)
+            .collect();
+
+        FileBlocks {
+            status: Self::file_status_from_pb(src.status),
+            block_locs,
+        }
+    }
+
+    pub fn file_block_details_to_pb(src: FileBlockDetails) -> GetFileBlockDetailsResponse {
+        let blocks = src
+            .blocks
+            .into_iter()
+            .map(|block| FileBlockDetailProto {
+                block_id: block.block_id,
+                block_size: block.len,
+                offset: block.offset,
+                replicas: block
+                    .replicas
+                    .into_iter()
+                    .map(|replica| BlockReplicaDetailProto {
+                        worker_id: replica.worker_id,
+                        storage_type: replica.storage_type.into(),
+                        address: replica.address.as_ref().map(Self::worker_address_to_pb),
+                        state: Some(Self::worker_status_to_pb(replica.state) as i32),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        GetFileBlockDetailsResponse {
+            status: Self::file_status_to_pb(src.status),
+            blocks,
+        }
+    }
+
+    pub fn file_block_details_from_pb(src: GetFileBlockDetailsResponse) -> FileBlockDetails {
+        let blocks = src
+            .blocks
+            .into_iter()
+            .map(|block| FileBlockDetail {
+                block_id: block.block_id,
+                len: block.block_size,
+                offset: block.offset,
+                replicas: block
+                    .replicas
+                    .into_iter()
+                    .map(|replica| BlockReplicaDetail {
+                        worker_id: replica.worker_id,
+                        storage_type: StorageType::from(replica.storage_type),
+                        address: replica.address.as_ref().map(Self::worker_address_from_pb),
+                        state: Self::worker_status_from_pb(replica.state),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        FileBlockDetails {
+            status: Self::file_status_from_pb(src.status),
+            blocks,
+        }
+    }
+
+    fn worker_status_to_pb(src: WorkerStatus) -> WorkerStatusProto {
+        match src {
+            WorkerStatus::Unknown => WorkerStatusProto::WorkerStatusUnknown,
+            WorkerStatus::Live => WorkerStatusProto::WorkerStatusLive,
+            WorkerStatus::Blacklist => WorkerStatusProto::WorkerStatusBlacklist,
+            WorkerStatus::Decommission => WorkerStatusProto::WorkerStatusDecommission,
+            WorkerStatus::Lost => WorkerStatusProto::WorkerStatusLost,
+        }
+    }
+
+    fn worker_status_from_pb(src: Option<i32>) -> WorkerStatus {
+        match src.unwrap_or(WorkerStatusProto::WorkerStatusUnknown as i32) {
+            value if value == WorkerStatusProto::WorkerStatusLive as i32 => WorkerStatus::Live,
+            value if value == WorkerStatusProto::WorkerStatusBlacklist as i32 => {
+                WorkerStatus::Blacklist
+            }
+            value if value == WorkerStatusProto::WorkerStatusDecommission as i32 => {
+                WorkerStatus::Decommission
+            }
+            value if value == WorkerStatusProto::WorkerStatusLost as i32 => WorkerStatus::Lost,
+            _ => WorkerStatus::Unknown,
+        }
+    }
+
+    pub fn filesystem_info_to_pb(src: FilesystemInfo) -> GetFilesystemInfoResponse {
+        let mut pb = GetFilesystemInfoResponse {
+            active_master: src.active_master,
+            journal_nodes: src.journal_nodes,
+            inode_dir_num: src.inode_dir_num,
+            inode_file_num: src.inode_file_num,
+            block_num: src.block_num,
+            capacity: src.capacity,
+            available: src.available,
+            fs_used: src.fs_used,
+            non_fs_used: src.non_fs_used,
+            reserved_bytes: src.reserved_bytes,
+            allocatable_capacity: Some(src.allocatable_capacity),
+            allocatable_available: Some(src.allocatable_available),
+            ..Default::default()
+        };
+
+        for item in src.live_workers {
+            pb.live_workers.push(Self::worker_info_to_pb(item));
+        }
+
+        for item in src.blacklist_workers {
+            pb.blacklist_workers.push(Self::worker_info_to_pb(item));
+        }
+
+        for item in src.decommission_workers {
+            pb.decommission_workers.push(Self::worker_info_to_pb(item));
+        }
+
+        for item in src.lost_workers {
+            pb.lost_workers.push(Self::worker_info_to_pb(item));
+        }
+
+        pb
+    }
+
+    pub fn worker_info_to_pb(src: WorkerInfo) -> WorkerInfoProto {
+        let mut pb = WorkerInfoProto {
+            address: ProtoUtils::worker_address_to_pb(&src.address),
+            capacity: src.capacity,
+            available: src.available,
+            fs_used: src.fs_used,
+            non_fs_used: src.non_fs_used,
+            last_update: src.last_update,
+            reserved_bytes: src.reserved_bytes,
+            weight: Some(src.weight),
+            worker_session_id: Some(src.worker_session_id),
+            transfer_task_submit: Some(src.transfer_capabilities.task_submit),
+            transfer_report_target: Some(src.transfer_capabilities.report_target),
+            transfer_query_task: Some(src.transfer_capabilities.query_task),
+            transfer_attempt_safe_output: Some(src.transfer_capabilities.attempt_safe_output),
+            transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
+            software_version: Some(src.software_version),
+            startup_time_ms: Some(src.startup_time_ms),
+            component_info: src.component_info,
+            storage_map: Default::default(),
+        };
+
+        for item in src.storage_map {
+            pb.storage_map
+                .insert(item.0, Self::storage_info_to_pb(item.1));
+        }
+
+        pb
+    }
+
+    pub fn filesystem_info_from_pb(src: GetFilesystemInfoResponse) -> FilesystemInfo {
+        FilesystemInfo {
+            active_master: src.active_master,
+            journal_nodes: src.journal_nodes,
+            inode_dir_num: src.inode_dir_num,
+            inode_file_num: src.inode_file_num,
+            block_num: src.block_num,
+            capacity: src.capacity,
+            available: src.available,
+            fs_used: src.fs_used,
+            non_fs_used: src.non_fs_used,
+            reserved_bytes: src.reserved_bytes,
+            // Legacy masters omit the allocatable fields; fall back to the
+            // aggregate capacity/available so statfs never regresses below the
+            // pre-fix behavior (which summed all non-lost workers).
+            allocatable_capacity: src.allocatable_capacity.unwrap_or(src.capacity),
+            allocatable_available: src.allocatable_available.unwrap_or(src.available),
+            live_workers: Self::worker_info_from_pb(src.live_workers),
+            blacklist_workers: Self::worker_info_from_pb(src.blacklist_workers),
+            decommission_workers: Self::worker_info_from_pb(src.decommission_workers),
+            lost_workers: Self::worker_info_from_pb(src.lost_workers),
+        }
+    }
+
+    /// Convert a structured component version into its wire representation for
+    /// handshake metadata (component_info / compatibility payloads).
+    pub fn component_version_to_pb(src: &ComponentVersion) -> ComponentInfoProto {
+        ComponentInfoProto {
+            component: Some(src.component.clone()),
+            release_version: Some(src.release_version.clone()),
+            git_commit: Some(src.git_commit.clone()),
+            git_tag: Some(src.git_tag.clone()),
+            git_branch: Some(src.git_branch.clone()),
+            protocol_version: Some(src.protocol_version),
+            min_protocol_version: Some(src.min_protocol_version),
+            capabilities: src.capabilities.clone(),
+        }
+    }
+
+    /// Build the default compatibility contract a master advertises during the
+    /// GetFilesystemInfo handshake: the master's own version plus a lenient
+    /// diagnose policy. Legacy peers without the field keep working untouched.
+    pub fn default_master_compatibility_to_pb(
+        src: &ComponentVersion,
+    ) -> ServerCompatibilityInfoProto {
+        ServerCompatibilityInfoProto {
+            server: Self::component_version_to_pb(src),
+            compatibility_mode: CompatibilityModeProto::Diagnose as i32,
+            ..Default::default()
+        }
+    }
+
+    /// Build the compatibility contract a server advertises from its own
+    /// version and the configured compatibility policy. The advertised mode,
+    /// minimum bounds and blocked versions mirror the policy so peers learn
+    /// what the server accepts; the protocol version range stays a product
+    /// contract carried by the server's own version.
+    pub fn compatibility_to_pb(
+        src: &ComponentVersion,
+        policy: &crate::CompatibilityPolicy,
+    ) -> ServerCompatibilityInfoProto {
+        let mut pb = Self::default_master_compatibility_to_pb(src);
+        pb.compatibility_mode = policy.mode.to_proto() as i32;
+        pb.min_worker_version = policy.min_worker_version.as_ref().map(|v| v.to_string());
+        pb.min_client_version = policy.min_client_version.as_ref().map(|v| v.to_string());
+        pb.blocked_versions = policy
+            .blocked_versions
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        pb
+    }
+
+    pub fn worker_info_from_pb(workers: Vec<WorkerInfoProto>) -> Vec<WorkerInfo> {
+        let mut vec = vec![];
+        for info in workers {
+            let mut worker_info = WorkerInfo {
+                address: Self::worker_address_from_pb(&info.address),
+                capacity: info.capacity,
+                available: info.available,
+                fs_used: info.fs_used,
+                non_fs_used: info.non_fs_used,
+                reserved_bytes: info.reserved_bytes,
+                weight: info.weight.unwrap_or_else(WorkerInfo::default_weight),
+                worker_session_id: info.worker_session_id.unwrap_or_default(),
+                transfer_capabilities: TransferWorkerCapabilities {
+                    task_submit: info.transfer_task_submit.unwrap_or(false),
+                    report_target: info.transfer_report_target.unwrap_or(false),
+                    query_task: info.transfer_query_task.unwrap_or(false),
+                    attempt_safe_output: info.transfer_attempt_safe_output.unwrap_or(false),
+                    source_read_plan: info.transfer_source_read_plan.unwrap_or(false),
+                },
+                software_version: info.software_version.unwrap_or_default(),
+                startup_time_ms: info.startup_time_ms.unwrap_or_default(),
+                component_info: info.component_info,
+                ..Default::default()
+            };
+            for (k, v) in info.storage_map {
+                worker_info
+                    .storage_map
+                    .insert(k, Self::storage_info_from_pb(v));
+            }
+            vec.push(worker_info);
+        }
+
+        vec
+    }
+
+    pub fn worker_cmd_to_pb(cmds: Vec<WorkerCommand>) -> Vec<WorkerCommandProto> {
+        let mut vec = vec![];
+        for cmd in cmds {
+            match cmd {
+                WorkerCommand::DeleteBlock(cmd) => {
+                    let pb_cmd = WorkerCommandProto {
+                        delete_block: Some(DeleteBlockCmdProto { blocks: cmd.blocks }),
+                    };
+                    vec.push(pb_cmd)
+                }
+            }
+        }
+
+        vec
+    }
+
+    pub fn worker_cmd_from_pb(cmds: Vec<WorkerCommandProto>) -> Vec<WorkerCommand> {
+        let mut vec = vec![];
+        for cmd in cmds {
+            if let Some(c) = cmd.delete_block {
+                let my_cmd = WorkerCommand::DeleteBlock(DeleteBlockCmd { blocks: c.blocks });
+                vec.push(my_cmd);
+            }
+        }
+        vec
+    }
+
+    pub fn block_report_list_from_pb(list: BlockReportListRequest) -> BlockReportList {
+        let mut dst = BlockReportList {
+            cluster_id: list.cluster_id,
+            worker_id: list.worker_id,
+            full_report: list.full_report,
+            total_len: list.total_len,
+            report_id: list.report_id.unwrap_or(0),
+            batch_index: list.batch_index,
+            blocks: vec![],
+        };
+        for block in list.blocks {
+            let dst_blocks = BlockReportInfo {
+                id: block.id,
+                status: BlockReportStatus::from(block.status),
+                storage_type: StorageType::from(block.storage_type),
+                block_size: block.block_size,
+                corrupted: block.corrupted.unwrap_or(false),
+            };
+            dst.blocks.push(dst_blocks);
+        }
+        dst
+    }
+
+    pub fn set_attr_opts_to_pb(opts: SetAttrOpts) -> SetAttrOptsProto {
+        SetAttrOptsProto {
+            recursive: opts.recursive,
+            replicas: opts.replicas,
+            owner: opts.owner,
+            group: opts.group,
+            mode: opts.mode,
+            atime: opts.atime,
+            mtime: opts.mtime,
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(|v| v as i32),
+            add_x_attr: opts.add_x_attr,
+            remove_x_attr: opts.remove_x_attr,
+            ufs_mtime: opts.ufs_mtime,
+        }
+    }
+
+    pub fn set_attr_opts_from_pb(opts: SetAttrOptsProto) -> SetAttrOpts {
+        SetAttrOpts {
+            recursive: opts.recursive,
+            replicas: opts.replicas,
+            owner: opts.owner,
+            group: opts.group,
+            mode: opts.mode,
+            atime: opts.atime,
+            mtime: opts.mtime,
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(TtlAction::from),
+            add_x_attr: opts.add_x_attr,
+            remove_x_attr: opts.remove_x_attr,
+            ufs_mtime: opts.ufs_mtime,
+        }
+    }
+
+    pub fn create_opts_to_pb(
+        opts: CreateFileOpts,
+        client_name: impl Into<String>,
+    ) -> CreateFileOptsProto {
+        CreateFileOptsProto {
+            create_flag: 0,
+            create_parent: opts.create_parent,
+            file_type: opts.file_type.into(),
+            replicas: opts.replicas as i32,
+            block_size: opts.block_size,
+            x_attr: opts.x_attr,
+            storage_policy: ProtoUtils::storage_policy_to_pb(opts.storage_policy),
+            client_name: client_name.into(),
+            mode: opts.mode,
+            owner: opts.owner,
+            group: opts.group,
+            sync_ufs_meta: opts.sync_ufs_meta,
+            ufs_len: opts.ufs_len,
+        }
+    }
+
+    pub fn create_opts_from_pb(opts: CreateFileOptsProto) -> CreateFileOpts {
+        CreateFileOpts {
+            create_parent: opts.create_parent,
+            file_type: FileType::from(opts.file_type),
+            replicas: opts.replicas as u16,
+            block_size: opts.block_size,
+            x_attr: opts.x_attr,
+            storage_policy: ProtoUtils::storage_policy_from_pb(opts.storage_policy),
+            mode: opts.mode,
+            client_name: opts.client_name,
+            owner: opts.owner,
+            group: opts.group,
+            sync_ufs_meta: opts.sync_ufs_meta,
+            ufs_len: opts.ufs_len,
+        }
+    }
+
+    pub fn mkdir_opts_to_pb(opts: MkdirOpts) -> MkdirOptsProto {
+        MkdirOptsProto {
+            create_parent: opts.create_parent,
+            x_attr: opts.x_attr,
+            storage_policy: ProtoUtils::storage_policy_to_pb(opts.storage_policy),
+            mode: opts.mode,
+            owner: opts.owner,
+            group: opts.group,
+        }
+    }
+
+    pub fn mkdir_opts_from_pb(opts: MkdirOptsProto) -> MkdirOpts {
+        MkdirOpts {
+            create_parent: opts.create_parent,
+            x_attr: opts.x_attr,
+            storage_policy: ProtoUtils::storage_policy_from_pb(opts.storage_policy),
+            mode: opts.mode,
+            owner: opts.owner,
+            group: opts.group,
+        }
+    }
+
+    pub fn list_options_from_pb(opts: ListOptionsProto) -> ListOptions {
+        ListOptions {
+            limit: opts.limit.map(|v| v as usize),
+            start_after: opts.start_after,
+        }
+    }
+
+    pub fn list_options_to_pb(opts: ListOptions) -> ListOptionsProto {
+        ListOptionsProto {
+            limit: opts.limit.map(|v| v as i32),
+            start_after: opts.start_after,
+        }
+    }
+
+    pub fn mount_info_to_pb(info: MountInfo) -> MountInfoProto {
+        MountInfoProto {
+            cv_path: info.cv_path,
+            ufs_path: info.ufs_path,
+            mount_id: info.mount_id,
+            properties: info.properties,
+            ttl_ms: info.ttl_ms,
+            ttl_action: info.ttl_action.into(),
+            read_verify_ufs: info.read_verify_ufs,
+            storage_type: info.storage_type.map(|v| v.into()),
+            block_size: info.block_size,
+            replicas: info.replicas,
+            write_type: info.write_type.into(),
+            provider: info.provider.map(|v| v.into()),
+            auto_cache: Some(info.auto_cache),
+            access_mode: Some(info.access_mode.into()),
+            write_cache: Some(info.write_cache),
+        }
+    }
+
+    pub fn mount_info_from_pb(info: MountInfoProto) -> MountInfo {
+        MountInfo {
+            cv_path: info.cv_path,
+            ufs_path: info.ufs_path,
+            mount_id: info.mount_id,
+            properties: info.properties,
+            ttl_ms: info.ttl_ms,
+            ttl_action: info.ttl_action.into(),
+            read_verify_ufs: info.read_verify_ufs,
+            storage_type: info.storage_type.map(|x| x.into()),
+            block_size: info.block_size,
+            replicas: info.replicas,
+            write_type: WriteType::from(info.write_type),
+            provider: info.provider.map(|x| x.into()),
+            auto_cache: info.auto_cache.unwrap_or(true),
+            access_mode: info.access_mode.map(AccessMode::from).unwrap_or_default(),
+            write_cache: info.write_cache.unwrap_or(false),
+        }
+    }
+
+    pub fn mount_options_to_pb(opts: MountOptions) -> MountOptionsProto {
+        MountOptionsProto {
+            update: opts.update,
+            add_properties: opts.add_properties,
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(|v| v.into()),
+            read_verify_ufs: opts.read_verify_ufs,
+            storage_type: opts.storage_type.map(|v| v.into()),
+            block_size: opts.block_size,
+            replicas: opts.replicas,
+            remove_properties: opts.remove_properties,
+            write_type: opts.write_type.into(),
+            provider: opts.provider.map(|v| v.into()),
+            auto_cache: opts.auto_cache,
+            access_mode: opts.access_mode.map(|v| v.into()),
+            write_cache: opts.write_cache,
+        }
+    }
+
+    pub fn mount_options_from_pb(opts: MountOptionsProto) -> MountOptions {
+        MountOptions {
+            update: opts.update,
+            add_properties: opts.add_properties,
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(TtlAction::from),
+            read_verify_ufs: opts.read_verify_ufs,
+            storage_type: opts.storage_type.map(StorageType::from),
+            block_size: opts.block_size,
+            replicas: opts.replicas,
+            remove_properties: opts.remove_properties,
+            write_type: opts.write_type.into(),
+            provider: opts.provider.map(Provider::from),
+            auto_cache: opts.auto_cache,
+            access_mode: opts.access_mode.map(AccessMode::from),
+            write_cache: opts.write_cache,
+        }
+    }
+
+    pub fn metrics_report_from_pb(report: Vec<MetricValueProto>) -> Vec<MetricValue> {
+        report
+            .into_iter()
+            .map(|metric| MetricValue {
+                metric_type: metric.metric_type.into(),
+                name: metric.name,
+                value: metric.value,
+                tags: metric.tags,
+            })
+            .collect()
+    }
+
+    pub fn metrics_report_to_pb(report: Vec<MetricValue>) -> Vec<MetricValueProto> {
+        report
+            .into_iter()
+            .map(|metric| MetricValueProto {
+                metric_type: metric.metric_type.into(),
+                name: metric.name,
+                value: metric.value,
+                tags: metric.tags,
+            })
+            .collect()
+    }
+
+    pub fn file_alloc_opts_to_pb(opts: FileAllocOpts) -> FileAllocOptsProto {
+        FileAllocOptsProto {
+            truncate: opts.truncate,
+            off: opts.off,
+            len: opts.len,
+            mode: opts.mode.bits(),
+        }
+    }
+
+    pub fn file_alloc_opts_from_pb(opts: FileAllocOptsProto) -> FileAllocOpts {
+        FileAllocOpts {
+            truncate: opts.truncate,
+            off: opts.off,
+            len: opts.len,
+            mode: FileAllocMode::from_bits_truncate(opts.mode),
+        }
+    }
+
+    pub fn file_lock_to_pb(lock: FileLock) -> FileLockProto {
+        FileLockProto {
+            client_id: lock.client_id,
+            owner_id: lock.owner_id,
+            pid: lock.pid,
+            acquire_time: lock.acquire_time,
+            lock_type: lock.lock_type as i32,
+            lock_flags: lock.lock_flags as i32,
+            start: lock.start,
+            end: lock.end,
+            session_owned: Some(lock.session_owned),
+        }
+    }
+
+    pub fn file_lock_from_pb(lock: FileLockProto) -> FileLock {
+        FileLock {
+            client_id: lock.client_id,
+            owner_id: lock.owner_id,
+            pid: lock.pid,
+            acquire_time: lock.acquire_time,
+            lock_type: LockType::from(lock.lock_type as u8),
+            lock_flags: LockFlags::from(lock.lock_flags as u8),
+            start: lock.start,
+            end: lock.end,
+            session_owned: lock.session_owned.unwrap_or(false),
+        }
+    }
+
+    pub fn free_res_from_pb(res: FreeResultProto) -> FreeResult {
+        FreeResult {
+            inodes: res.inodes,
+            bytes: res.bytes,
+            ..Default::default()
+        }
+    }
+
+    pub fn free_res_to_pb(res: FreeResult) -> FreeResultProto {
+        FreeResultProto {
+            inodes: res.inodes,
+            bytes: res.bytes,
+        }
+    }
+
+    pub fn delete_res_from_pb(res: FreeResultProto) -> DeleteResult {
+        Self::free_res_from_pb(res).into()
+    }
+
+    pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
+        Self::free_res_to_pb(res.into())
+    }
+
+    pub fn trash_entry_to_pb(src: TrashEntry) -> TrashEntryProto {
+        let mut status = Self::file_status_to_pb(src.status);
+        // Trash listings never expose user xattrs, and one entry carrying a
+        // large metadata blob would otherwise consume the whole ListTrash
+        // response budget (or even exceed the RPC frame limit).
+        status.x_attr.clear();
+        TrashEntryProto {
+            path: src.path,
+            origin: src.origin,
+            delete_ms: src.delete_ms,
+            status,
+        }
+    }
+
+    pub fn trash_entry_from_pb(src: TrashEntryProto) -> TrashEntry {
+        TrashEntry {
+            path: src.path,
+            origin: src.origin,
+            delete_ms: src.delete_ms,
+            status: Self::file_status_from_pb(src.status),
+        }
+    }
+
+    pub fn restore_trash_res_to_pb(src: RestoreTrashResult) -> RestoreTrashResponse {
+        RestoreTrashResponse {
+            dst: src.dst,
+            status: src.status.map(Self::file_status_to_pb),
+        }
+    }
+
+    pub fn restore_trash_res_from_pb(src: RestoreTrashResponse) -> RestoreTrashResult {
+        RestoreTrashResult {
+            dst: src.dst,
+            status: src.status.map(Self::file_status_from_pb),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::proto::CompatibilityModeProto;
+    use crate::state::{
+        AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, StorageInfo,
+        TrashEntry, INTERNAL_CTIME_XATTR,
+    };
+    use crate::utils::ProtoUtils;
+    use curvine_sys::version::ComponentVersion;
+    use std::collections::HashMap;
+
+    #[test]
+    fn storage_info_failed_round_trip() {
+        let info = StorageInfo {
+            dir_id: 3,
+            storage_id: "v1-3".to_string(),
+            failed: true,
+            capacity: 1024,
+            dir_path: "/data/3".to_string(),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::storage_info_to_pb(info.clone());
+        assert!(pb.failed);
+
+        let round_trip = ProtoUtils::storage_info_from_pb(pb);
+        assert!(round_trip.failed, "failed state must reach the master");
+        assert_eq!(round_trip.dir_id, info.dir_id);
+    }
+
+    #[test]
+    fn test_mount_info_proto_round_trip_auto_cache_and_access_mode() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://bucket".to_string(),
+            mount_id: 7,
+            auto_cache: false,
+            access_mode: AccessMode::ReadWrite,
+            write_cache: true,
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::mount_info_to_pb(info);
+        let round_trip = ProtoUtils::mount_info_from_pb(pb);
+
+        assert!(!round_trip.auto_cache);
+        assert_eq!(round_trip.access_mode, AccessMode::ReadWrite);
+        assert!(round_trip.write_cache);
+    }
+
+    #[test]
+    fn test_mount_options_proto_round_trip_auto_cache_and_access_mode() {
+        let opts = MountOptions::builder()
+            .auto_cache(false)
+            .access_mode(AccessMode::ReadWrite)
+            .write_cache(true)
+            .build();
+
+        let pb = ProtoUtils::mount_options_to_pb(opts);
+        let round_trip = ProtoUtils::mount_options_from_pb(pb);
+
+        assert_eq!(round_trip.auto_cache, Some(false));
+        assert_eq!(round_trip.access_mode, Some(AccessMode::ReadWrite));
+        assert_eq!(round_trip.write_cache, Some(true));
+    }
+
+    #[test]
+    fn test_mount_options_proto_round_trip_read_verify_ufs() {
+        // An unspecified value must stay absent on the wire so an update keeps
+        // the stored mount setting.
+        let opts = MountOptions::builder().update(true).build();
+        let pb = ProtoUtils::mount_options_to_pb(opts);
+        assert_eq!(pb.read_verify_ufs, None);
+        assert_eq!(ProtoUtils::mount_options_from_pb(pb).read_verify_ufs, None);
+
+        for value in [true, false] {
+            let opts = MountOptions::builder().read_verify_ufs(value).build();
+            let pb = ProtoUtils::mount_options_to_pb(opts);
+            assert_eq!(pb.read_verify_ufs, Some(value));
+            assert_eq!(
+                ProtoUtils::mount_options_from_pb(pb).read_verify_ufs,
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
+    fn trash_entry_proto_round_trip() {
+        let entry = TrashEntry {
+            path: "/.Trash/123-7".to_string(),
+            origin: "/data/a.log".to_string(),
+            delete_ms: 123,
+            status: FileStatus {
+                id: 7,
+                path: "/.Trash/123-7".to_string(),
+                name: "123-7".to_string(),
+                x_attr: HashMap::from([("user.meta".to_string(), vec![b'x'; 32])]),
+                ..Default::default()
+            },
+        };
+
+        let pb = ProtoUtils::trash_entry_to_pb(entry);
+        assert_eq!(pb.path, "/.Trash/123-7");
+        assert_eq!(pb.origin, "/data/a.log");
+        assert_eq!(pb.delete_ms, 123);
+        assert!(
+            pb.status.x_attr.is_empty(),
+            "trash listings must not carry user xattrs"
+        );
+
+        let round_trip = ProtoUtils::trash_entry_from_pb(pb);
+        assert_eq!(round_trip.path, "/.Trash/123-7");
+        assert_eq!(round_trip.origin, "/data/a.log");
+        assert_eq!(round_trip.delete_ms, 123);
+        assert_eq!(round_trip.status.id, 7);
+        assert_eq!(round_trip.status.path, "/.Trash/123-7");
+    }
+
+    #[test]
+    fn restore_trash_result_proto_round_trip() {
+        let restored = RestoreTrashResult {
+            dst: Some("/data/a.log".to_string()),
+            status: Some(FileStatus {
+                id: 7,
+                path: "/data/a.log".to_string(),
+                ..Default::default()
+            }),
+        };
+
+        let pb = ProtoUtils::restore_trash_res_to_pb(restored);
+        assert_eq!(pb.dst.as_deref(), Some("/data/a.log"));
+
+        let round_trip = ProtoUtils::restore_trash_res_from_pb(pb);
+        assert_eq!(round_trip.dst.as_deref(), Some("/data/a.log"));
+        assert_eq!(round_trip.status.unwrap().id, 7);
+
+        // Retry-cache hits carry neither field.
+        let empty = ProtoUtils::restore_trash_res_from_pb(Default::default());
+        assert!(empty.dst.is_none());
+        assert!(empty.status.is_none());
+    }
+
+    #[test]
+    fn file_status_proto_preserves_ctime_and_falls_back_for_legacy_peers() {
+        let status = FileStatus {
+            mtime: 1_000,
+            x_attr: HashMap::from([(
+                INTERNAL_CTIME_XATTR.to_string(),
+                2_000_i64.to_le_bytes().to_vec(),
+            )]),
+            ..Default::default()
+        };
+
+        let mut pb = ProtoUtils::file_status_to_pb(status);
+        assert_eq!(pb.ctime, Some(2_000));
+        assert!(!pb.x_attr.contains_key(INTERNAL_CTIME_XATTR));
+        assert_eq!(ProtoUtils::file_status_from_pb(pb.clone()).ctime(), 2_000);
+
+        pb.ctime = None;
+        assert_eq!(ProtoUtils::file_status_from_pb(pb).ctime(), 1_000);
+    }
+
+    #[test]
+    fn file_status_proto_filters_all_internal_xattrs() {
+        let status = FileStatus {
+            x_attr: HashMap::from([
+                ("user.visible".to_string(), b"v".to_vec()),
+                ("\0curvine.trash.origin".to_string(), b"/a".to_vec()),
+                (
+                    "\0curvine.trash.delete_ms".to_string(),
+                    1_i64.to_le_bytes().to_vec(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::file_status_to_pb(status);
+
+        assert_eq!(pb.x_attr.len(), 1);
+        assert!(pb.x_attr.contains_key("user.visible"));
+    }
+
+    #[test]
+    fn file_status_proto_keeps_legacy_ctime_optional() {
+        let status = FileStatus {
+            mtime: 1_000,
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::file_status_to_pb(status);
+        assert_eq!(pb.ctime, None);
+
+        let round_trip = ProtoUtils::file_status_from_pb(pb);
+        assert_eq!(round_trip.ctime(), 1_000);
+        assert!(!round_trip.x_attr.contains_key(INTERNAL_CTIME_XATTR));
+    }
+
+    #[test]
+    fn component_version_to_pb_maps_all_fields() {
+        let version = ComponentVersion {
+            component: "master".to_string(),
+            release_version: "0.4.0-alpha".to_string(),
+            git_commit: "359fce7d982a15f09c3b4e0b2e62fee4229609dd".to_string(),
+            git_tag: "v0.4.0-alpha".to_string(),
+            git_branch: "main".to_string(),
+            protocol_version: 1,
+            min_protocol_version: 1,
+            capabilities: vec!["transfer".to_string(), "batch-write".to_string()],
+        };
+
+        let pb = ProtoUtils::component_version_to_pb(&version);
+
+        assert_eq!(pb.component.as_deref(), Some("master"));
+        assert_eq!(pb.release_version.as_deref(), Some("0.4.0-alpha"));
+        assert_eq!(
+            pb.git_commit.as_deref(),
+            Some("359fce7d982a15f09c3b4e0b2e62fee4229609dd")
+        );
+        assert_eq!(pb.git_tag.as_deref(), Some("v0.4.0-alpha"));
+        assert_eq!(pb.git_branch.as_deref(), Some("main"));
+        assert_eq!(pb.protocol_version, Some(1));
+        assert_eq!(pb.min_protocol_version, Some(1));
+        assert_eq!(
+            pb.capabilities,
+            vec!["transfer".to_string(), "batch-write".to_string()]
+        );
+    }
+
+    #[test]
+    fn default_master_compatibility_embeds_server_and_is_diagnose() {
+        let version = ComponentVersion {
+            component: "master".to_string(),
+            release_version: "0.4.0-alpha".to_string(),
+            git_commit: "abc".to_string(),
+            git_tag: String::new(),
+            git_branch: "main".to_string(),
+            protocol_version: 1,
+            min_protocol_version: 1,
+            capabilities: vec![],
+        };
+
+        let pb = ProtoUtils::default_master_compatibility_to_pb(&version);
+
+        assert_eq!(pb.server.component.as_deref(), Some("master"));
+        assert_eq!(pb.server.release_version.as_deref(), Some("0.4.0-alpha"));
+        assert_eq!(
+            pb.compatibility_mode,
+            CompatibilityModeProto::Diagnose as i32
+        );
+        assert!(pb.min_worker_version.is_none());
+        assert!(pb.min_client_version.is_none());
+        assert!(pb.blocked_versions.is_empty());
+    }
+}

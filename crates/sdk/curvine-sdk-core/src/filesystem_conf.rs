@@ -1,0 +1,624 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![allow(clippy::should_implement_trait)]
+
+use curvine_config::{ClientConf, ClusterConf, TransferConf};
+use curvine_core_error::{err_box, try_err};
+use curvine_error::FsResult;
+use curvine_net::net::InetAddr;
+use curvine_runtime::common::LogConf;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FilesystemConf {
+    pub master_addrs: String,
+    pub client_hostname: String,
+    pub io_threads: usize,
+    pub worker_threads: usize,
+    pub replicas: i32,
+    pub block_size: String,
+    pub short_circuit: bool,
+
+    pub write_chunk_size: String,
+    pub write_chunk_num: usize,
+
+    pub read_chunk_size: String,
+    pub read_chunk_num: usize,
+    // Chunk requests kept in flight per remote block read; see
+    // ClientConf::read_pipeline_depth. 1 sends one request at a time.
+    pub read_pipeline_depth: usize,
+    pub read_parallel: i64,
+    pub read_slice_size: String,
+
+    pub max_cache_block_handles: usize,
+
+    pub storage_type: String,
+    pub ttl_ms: String,
+    pub ttl_action: String,
+
+    pub auto_cache_enabled: bool,
+    pub auto_cache_ttl: String,
+    pub default_cache_ttl: Option<String>,
+
+    // Set up the customer service retry policy
+    pub conn_retry_max_duration_ms: u64,
+    pub conn_retry_min_sleep_ms: u64,
+    pub conn_retry_max_sleep_ms: u64,
+
+    // rpc requests retry policy.
+    pub rpc_retry_max_duration_ms: u64,
+    pub rpc_retry_min_sleep_ms: u64,
+    pub rpc_retry_max_sleep_ms: u64,
+
+    // Whether to close the idle rpc connection.
+    pub rpc_close_idle: bool,
+    //Configuration of timeout for a request.
+    pub conn_timeout_ms: u64,
+    pub rpc_timeout_ms: u64,
+    pub data_timeout_ms: u64,
+
+    // Number of fs master connections.
+    // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
+    pub master_conn_pool_size: usize,
+
+    // Whether to enable pre-reading, it only controls whether short-circuit read and write, and whether it is turned on.
+    // The worker terminal is currently open forever.
+    pub enable_read_ahead: bool,
+
+    // Read preview size
+    pub read_ahead_len: String,
+
+    pub drop_cache_len: String,
+
+    // Log configuration
+    pub log_level: String,
+    pub log_dir: String,
+    pub log_file_name: String,
+    pub max_log_files: usize,
+    pub display_thread: bool,
+    pub display_position: bool,
+
+    #[serde(alias = "failed_worker_ttl")]
+    pub failed_worker_ttl_ms: u64,
+
+    pub enable_unified_fs: bool,
+    pub enable_rust_read_ufs: bool,
+
+    #[serde(alias = "mount_update_ttl")]
+    pub mount_update_ttl_ms: u64,
+
+    #[serde(alias = "sync_check_interval_min")]
+    pub sync_check_interval_min_ms: u64,
+    #[serde(alias = "sync_check_interval_max")]
+    pub sync_check_interval_max_ms: u64,
+    #[serde(alias = "max_sync_wait_timeout")]
+    pub max_sync_wait_timeout_ms: u64,
+    pub sync_check_log_tick: u32,
+
+    pub enable_block_conn_pool: bool,
+    pub block_conn_idle_size: usize,
+    #[serde(alias = "block_conn_idle_time")]
+    pub block_conn_idle_time_ms: u64,
+
+    pub small_file_size: String,
+
+    pub enable_smart_prefetch: bool,
+    pub large_file_size: String,
+    pub max_read_parallel: i64,
+    pub sequential_read_threshold: u64,
+
+    /// Client-side Transfer routing only. Service-side store and scheduler settings remain
+    /// owned by the Transfer process configuration.
+    pub transfer: TransferClientConf,
+
+    // Forward-seek absorption window (byte-size string, e.g. "4MB"); "0"
+    // disables it. See ClientConf::seek_absorb_window for the preconditions
+    // (enable_smart_prefetch and read_chunk_num > 1) and side effects.
+    // Appended last: new public fields go at the end of the struct.
+    pub seek_absorb_window: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransferClientConf {
+    pub endpoints: Vec<String>,
+    pub client_pending_queue_size: usize,
+    pub client_submit_concurrency: usize,
+}
+
+impl Default for TransferClientConf {
+    fn default() -> Self {
+        Self {
+            endpoints: vec![],
+            client_pending_queue_size: TransferConf::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
+            client_submit_concurrency: TransferConf::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
+        }
+    }
+}
+
+impl FilesystemConf {
+    pub fn from_str<T: AsRef<str>>(conf: T) -> FsResult<Self> {
+        let conf = try_err!(toml::from_str::<Self>(conf.as_ref()));
+        Ok(conf)
+    }
+
+    /// Minimal client settings for connecting with master addresses only.
+    pub fn with_master_addrs(addrs: impl IntoIterator<Item = impl AsRef<str>>) -> FsResult<Self> {
+        let master_addrs = addrs
+            .into_iter()
+            .map(|addr| addr.as_ref().to_string())
+            .collect::<Vec<_>>();
+        if master_addrs.is_empty() {
+            return err_box!("master_addrs can not be empty");
+        }
+        let log = LogConf::default();
+        // Derive the retry policy from the shared ClientConf defaults so a default
+        // change cannot leave this constructor on stale literals.
+        let rpc_defaults = ClientConf::default();
+        Ok(Self {
+            master_addrs: master_addrs.join(","),
+            io_threads: 16,
+            worker_threads: 16,
+            master_conn_pool_size: 1,
+            conn_timeout_ms: 30_000,
+            rpc_timeout_ms: 120_000,
+            data_timeout_ms: rpc_defaults.data_timeout_ms,
+            conn_retry_max_duration_ms: rpc_defaults.conn_retry_max_duration_ms,
+            conn_retry_min_sleep_ms: rpc_defaults.conn_retry_min_sleep_ms,
+            conn_retry_max_sleep_ms: rpc_defaults.conn_retry_max_sleep_ms,
+            rpc_retry_max_duration_ms: rpc_defaults.rpc_retry_max_duration_ms,
+            rpc_retry_min_sleep_ms: rpc_defaults.rpc_retry_min_sleep_ms,
+            rpc_retry_max_sleep_ms: rpc_defaults.rpc_retry_max_sleep_ms,
+            block_size: "128MB".to_string(),
+            write_chunk_size: "128KB".to_string(),
+            read_chunk_size: "128KB".to_string(),
+            read_pipeline_depth: 1,
+            read_slice_size: "0".to_string(),
+            read_ahead_len: "1MB".to_string(),
+            drop_cache_len: "64MB".to_string(),
+            ttl_ms: "0".to_string(),
+            ttl_action: "none".to_string(),
+            storage_type: "disk".to_string(),
+            failed_worker_ttl_ms: 30_000,
+            mount_update_ttl_ms: 5 * 60_000,
+            sync_check_interval_min_ms: 1_000,
+            sync_check_interval_max_ms: 5_000,
+            max_sync_wait_timeout_ms: 30_000,
+            block_conn_idle_time_ms: 30_000,
+            small_file_size: "1MB".to_string(),
+            large_file_size: "64MB".to_string(),
+            seek_absorb_window: "0".to_string(),
+            log_level: log.level,
+            log_dir: log.log_dir,
+            log_file_name: log.file_name,
+            ..Default::default()
+        })
+    }
+
+    pub fn into_cluster_conf(self) -> FsResult<ClusterConf> {
+        if self.master_addrs.trim().is_empty() {
+            return err_box!("fs.cv.master_addrs can not be empty");
+        }
+
+        let master_addrs = match InetAddr::parse_list(&self.master_addrs) {
+            Ok(addrs) => addrs,
+            Err(e) => {
+                return err_box!(
+                    "wrong format fs.cv.master_addrs {}: {}",
+                    self.master_addrs,
+                    e
+                );
+            }
+        };
+
+        let client = ClientConf {
+            master_addrs,
+            hostname: self.client_hostname.trim().to_string(),
+            io_threads: self.io_threads,
+            worker_threads: self.worker_threads,
+            replicas: self.replicas,
+            block_size: 0,
+            block_size_str: self.block_size,
+            short_circuit: self.short_circuit,
+
+            write_chunk_size: 0,
+            write_chunk_size_str: self.write_chunk_size,
+            write_chunk_num: self.write_chunk_num,
+
+            read_chunk_size: 0,
+            read_chunk_size_str: self.read_chunk_size,
+            read_chunk_num: self.read_chunk_num,
+            read_pipeline_depth: self.read_pipeline_depth,
+
+            read_parallel: self.read_parallel,
+            read_slice_size: 0,
+            read_slice_size_str: self.read_slice_size,
+
+            max_cache_block_handles: self.max_cache_block_handles,
+
+            conn_retry_max_duration_ms: self.conn_retry_max_duration_ms,
+            conn_retry_min_sleep_ms: self.conn_retry_min_sleep_ms,
+            conn_retry_max_sleep_ms: self.conn_retry_max_sleep_ms,
+
+            rpc_retry_max_duration_ms: self.rpc_retry_max_duration_ms,
+            rpc_retry_min_sleep_ms: self.rpc_retry_min_sleep_ms,
+            rpc_retry_max_sleep_ms: self.rpc_retry_max_sleep_ms,
+
+            conn_timeout_ms: self.conn_timeout_ms,
+            rpc_timeout_ms: self.rpc_timeout_ms,
+            data_timeout_ms: self.data_timeout_ms,
+            master_conn_pool_size: self.master_conn_pool_size,
+            rpc_close_idle: self.rpc_close_idle,
+
+            enable_read_ahead: self.enable_read_ahead,
+            read_ahead_len: 0,
+            read_ahead_len_str: self.read_ahead_len,
+            drop_cache_len: 0,
+            drop_cache_len_str: self.drop_cache_len,
+
+            storage_type_str: self.storage_type,
+            ttl_ms_str: self.ttl_ms,
+            ttl_action_str: self.ttl_action,
+
+            auto_cache_enabled: self.auto_cache_enabled,
+            auto_cache_ttl: self.auto_cache_ttl,
+            default_cache_ttl: self.default_cache_ttl,
+
+            failed_worker_ttl_ms: self.failed_worker_ttl_ms,
+
+            enable_unified_fs: self.enable_unified_fs,
+            enable_rust_read_ufs: self.enable_rust_read_ufs,
+            mount_update_ttl_ms: self.mount_update_ttl_ms,
+
+            sync_check_interval_min_ms: self.sync_check_interval_min_ms,
+            sync_check_interval_max_ms: self.sync_check_interval_max_ms,
+            max_sync_wait_timeout_ms: self.max_sync_wait_timeout_ms,
+            sync_check_log_tick: self.sync_check_log_tick,
+
+            enable_block_conn_pool: self.enable_block_conn_pool,
+            block_conn_idle_size: self.block_conn_idle_size,
+            block_conn_idle_time_ms: self.block_conn_idle_time_ms,
+
+            small_file_size_str: self.small_file_size,
+
+            enable_smart_prefetch: self.enable_smart_prefetch,
+            large_file_size_str: self.large_file_size,
+            max_read_parallel: self.max_read_parallel,
+            sequential_read_threshold: self.sequential_read_threshold,
+
+            // The derived FilesystemConf::default() leaves the string empty,
+            // which ClientConf::init() rejects; treat empty as "disabled".
+            seek_absorb_window_str: if self.seek_absorb_window.trim().is_empty() {
+                "0".to_string()
+            } else {
+                self.seek_absorb_window
+            },
+
+            ..Default::default()
+        };
+
+        let log = LogConf {
+            level: self.log_level,
+            log_dir: self.log_dir,
+            file_name: self.log_file_name,
+            max_log_files: self.max_log_files,
+            display_thread: self.display_thread,
+            display_position: self.display_position,
+            ..Default::default()
+        };
+
+        let mut cluster = ClusterConf {
+            client,
+            log,
+            transfer: TransferConf {
+                endpoints: self.transfer.endpoints,
+                client_pending_queue_size: self.transfer.client_pending_queue_size,
+                client_submit_concurrency: self.transfer.client_submit_concurrency,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cluster.client.init()?;
+        cluster.transfer.init()?;
+        Ok(cluster)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FilesystemConf, TransferClientConf};
+    use curvine_config::ClientConf;
+    use std::time::Duration;
+
+    #[test]
+    fn default_master_conn_pool_size_is_one() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert_eq!(conf.master_conn_pool_size, 1);
+
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.master_conn_pool_size, 1);
+    }
+
+    #[test]
+    fn with_master_addrs_sets_default_retry_policy() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        let defaults = ClientConf::default();
+
+        assert_eq!(
+            cluster.client.conn_retry_max_duration_ms,
+            defaults.conn_retry_max_duration_ms
+        );
+        assert_eq!(
+            cluster.client.conn_retry_min_sleep_ms,
+            defaults.conn_retry_min_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.conn_retry_max_sleep_ms,
+            defaults.conn_retry_max_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_min_sleep_ms,
+            defaults.rpc_retry_min_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_max_sleep_ms,
+            defaults.rpc_retry_max_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_max_duration_ms,
+            defaults.rpc_retry_max_duration_ms
+        );
+    }
+
+    #[test]
+    fn explicit_retry_policy_is_not_replaced() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.rpc_retry_min_sleep_ms = 200;
+        conf.rpc_retry_max_sleep_ms = 1_500;
+        conf.rpc_retry_max_duration_ms = 30_000;
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert_eq!(cluster.client.rpc_retry_min_sleep_ms, 200);
+        assert_eq!(cluster.client.rpc_retry_max_sleep_ms, 1_500);
+        assert_eq!(cluster.client.rpc_retry_max_duration_ms, 30_000);
+    }
+
+    #[test]
+    fn maps_seek_absorb_window_into_client_conf() {
+        // An explicit value flows through to ClientConf and parses.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.seek_absorb_window = "4MB".to_string();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.seek_absorb_window, 4 * 1024 * 1024);
+
+        // Unset (the derived default is an empty string) means disabled, not
+        // an init error.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.seek_absorb_window = String::new();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.seek_absorb_window, 0);
+    }
+
+    #[test]
+    fn trims_whitespace_in_comma_separated_master_addrs() {
+        let mut conf = FilesystemConf::with_master_addrs(["placeholder:8995"]).unwrap();
+        // Production Hadoop/XML often inserts a space after only some commas.
+        // Without trim, only the padded hostname fails DNS, so a leader on that
+        // node looks like "all masters unavailable".
+        conf.master_addrs = "curvine-master-01.example.com:8995, curvine-master-02.example.com:8995,curvine-master-03.example.com:8995"
+            .to_string();
+
+        let cluster = conf.into_cluster_conf().unwrap();
+        let hostnames: Vec<&str> = cluster
+            .client
+            .master_addrs
+            .iter()
+            .map(|addr| addr.hostname.as_str())
+            .collect();
+        assert_eq!(
+            hostnames,
+            [
+                "curvine-master-01.example.com",
+                "curvine-master-02.example.com",
+                "curvine-master-03.example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn into_cluster_conf_includes_parse_error_for_invalid_master_addrs() {
+        let mut conf = FilesystemConf::with_master_addrs(["placeholder:8995"]).unwrap();
+        conf.master_addrs = "host-a:8995, host-b:not-a-port".to_string();
+
+        let err = conf
+            .into_cluster_conf()
+            .expect_err("invalid master_addrs must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wrong format fs.cv.master_addrs host-a:8995, host-b:not-a-port"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("invalid digit found in string"),
+            "parse error should be included: {msg}"
+        );
+    }
+
+    #[test]
+    fn parses_data_timeout_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                data_timeout_ms = 45000
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.data_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn maps_read_pipeline_depth_into_client_conf() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert_eq!(conf.read_pipeline_depth, 1);
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 1);
+
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.read_pipeline_depth = 4;
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 4);
+    }
+
+    #[test]
+    fn parses_read_pipeline_depth_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                read_pipeline_depth = 4
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 4);
+    }
+
+    #[test]
+    fn java_default_data_timeout_outlasts_the_master_failover_budget() {
+        // `FilesystemConf.java` mirrors every field into the toml that
+        // `JavaFilesystem::new` parses, so this is the Java `closeWriter` chain.
+        // The writer handshake is bounded by `data_timeout()`, which must outlast
+        // a Complete/Flush that drains the queued writes and then retries the
+        // master through a failover: rpc_timeout + rpc_retry_max_duration.
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                rpc_timeout_ms = 120000
+                rpc_retry_max_duration_ms = 120000
+                data_timeout_ms = 300000
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        let failover = Duration::from_millis(
+            cluster.client.rpc_timeout_ms + cluster.client.rpc_retry_max_duration_ms,
+        );
+        assert!(
+            cluster.client.data_timeout() > failover,
+            "the Java SDK handshake deadline {:?} must exceed the failover budget {:?}",
+            cluster.client.data_timeout(),
+            failover
+        );
+    }
+
+    #[test]
+    fn keeps_transfer_routing_in_cluster_conf() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.transfer = TransferClientConf {
+            endpoints: vec!["transfer-0:9010".to_string(), "transfer-1:9010".to_string()],
+            client_pending_queue_size: 2048,
+            client_submit_concurrency: 128,
+        };
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert_eq!(
+            cluster.transfer.endpoints,
+            vec!["transfer-0:9010", "transfer-1:9010"]
+        );
+        assert_eq!(cluster.transfer.client_pending_queue_size(), 2048);
+        assert_eq!(cluster.transfer.client_submit_concurrency(), 128);
+    }
+
+    #[test]
+    fn parses_transfer_routing_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                client_hostname = "java-client"
+                io_threads = 16
+                worker_threads = 16
+                replicas = 1
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                write_chunk_num = 8
+                read_chunk_size = "128KB"
+                read_chunk_num = 8
+                read_parallel = 1
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+
+                [transfer]
+                endpoints = ["transfer-0:9010", "transfer-1:9010"]
+                client_pending_queue_size = 4096
+                client_submit_concurrency = 256
+            "#,
+        )
+        .unwrap();
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert_eq!(
+            cluster.transfer.endpoints,
+            vec!["transfer-0:9010", "transfer-1:9010"]
+        );
+        assert_eq!(cluster.transfer.client_pending_queue_size(), 4096);
+        assert_eq!(cluster.transfer.client_submit_concurrency(), 256);
+    }
+}

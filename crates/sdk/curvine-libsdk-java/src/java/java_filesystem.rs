@@ -1,0 +1,324 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::java::JavaUtils;
+use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
+use curvine_core_error::{err_box, try_err};
+use curvine_error::{FsError, FsResult};
+use curvine_fs_api::proto::{
+    FreeResponse, GetMountTableResponse, MountOptionsProto, SetAttrOptsProto,
+};
+use curvine_fs_api::state::{DeleteResult, SetAttrOpts};
+use curvine_fs_api::utils::ProtoUtils;
+use curvine_sdk_core::blocking_job as job;
+use jni::objects::{JByteArray, JString};
+use jni::sys::{jarray, jboolean, jint, jstring};
+use jni::JNIEnv;
+use prost::Message;
+
+pub struct JavaFilesystem {
+    inner: LibFilesystem,
+}
+
+fn decode_mount_options(bytes: &[u8]) -> FsResult<curvine_fs_api::state::MountOptions> {
+    if bytes.is_empty() {
+        return err_box!("mount options cannot be empty");
+    }
+    let options = try_err!(MountOptionsProto::decode(bytes));
+    Ok(ProtoUtils::mount_options_from_pb(options))
+}
+
+fn decode_set_attr_options(bytes: &[u8]) -> FsResult<SetAttrOpts> {
+    if bytes.is_empty() {
+        return err_box!("set attr options cannot be empty");
+    }
+    let options = try_err!(SetAttrOptsProto::decode(bytes));
+    Ok(ProtoUtils::set_attr_opts_from_pb(options))
+}
+
+fn decode_optional_path(env: &mut JNIEnv, path: JString) -> FsResult<Option<String>> {
+    if path.is_null() {
+        return Ok(None);
+    }
+    let value = JavaUtils::jstring_to_string(env, &path)?;
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+impl JavaFilesystem {
+    pub fn new(env: &mut JNIEnv, conf: JString) -> FsResult<Self> {
+        let toml_str = JavaUtils::jstring_to_string(env, &conf)?;
+        let fs_conf = FilesystemConf::from_str(toml_str)?;
+        let cluster_conf = fs_conf.into_cluster_conf()?;
+
+        let inner = LibFilesystem::new(cluster_conf)?;
+        Ok(Self { inner })
+    }
+
+    pub fn create(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        overwrite: jboolean,
+    ) -> FsResult<LibFsWriter> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        self.inner.create(path, JavaUtils::jbool_to_bool(overwrite))
+    }
+
+    /// Append for Hadoop's `FileSystem.append`: the file must exist, so a
+    /// missing file is an error rather than created.
+    pub fn append(&self, env: &mut JNIEnv, path: JString) -> FsResult<LibFsWriter> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        self.inner.append_existing(path)
+    }
+
+    pub fn open(&self, env: &mut JNIEnv, path: JString) -> FsResult<LibFsReader> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        self.inner.open(path)
+    }
+
+    pub fn mkdir(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        create_parent: jboolean,
+    ) -> FsResult<bool> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        self.inner
+            .mkdir(path, JavaUtils::jbool_to_bool(create_parent))
+    }
+
+    pub fn get_file_status(&self, env: &mut JNIEnv, path: JString) -> FsResult<jarray> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let status = self.inner.get_status(path)?;
+
+        let byte_arr = JavaUtils::new_jarray(env, &status)?;
+        Ok(byte_arr)
+    }
+
+    pub fn set_attr(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        options: JByteArray,
+    ) -> FsResult<jarray> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let options = env
+            .convert_byte_array(&options)
+            .map_err(FsError::from_error)?;
+        let status = self
+            .inner
+            .set_attr(path, decode_set_attr_options(&options)?)?;
+        let byte_arr = JavaUtils::new_jarray(env, &status)?;
+        Ok(byte_arr)
+    }
+
+    pub fn list_status(&self, env: &mut JNIEnv, path: JString) -> FsResult<jarray> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let status = self.inner.list_status(path)?;
+
+        let byte_arr = JavaUtils::new_jarray(env, &status)?;
+        Ok(byte_arr)
+    }
+
+    pub fn rename(&self, env: &mut JNIEnv, src: JString, dst: JString) -> FsResult<bool> {
+        let src = JavaUtils::jstring_to_string(env, &src)?;
+        let dst = JavaUtils::jstring_to_string(env, &dst)?;
+        self.inner.rename(src, dst)
+    }
+
+    pub fn delete(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        recursive: jboolean,
+    ) -> FsResult<DeleteResult> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        self.inner.delete(path, JavaUtils::jbool_to_bool(recursive))
+    }
+
+    /// Deletes without waiting for the master to reclaim the entry. The returned
+    /// counts are zero because nothing has been reclaimed yet.
+    pub fn delete_async(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        recursive: jboolean,
+    ) -> FsResult<DeleteResult> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        self.inner
+            .delete_async(path, JavaUtils::jbool_to_bool(recursive))
+    }
+
+    pub fn free(&self, env: &mut JNIEnv, path: JString, recursive: jboolean) -> FsResult<jarray> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let result = self.inner.free(path, JavaUtils::jbool_to_bool(recursive))?;
+        let response = FreeResponse {
+            res: ProtoUtils::free_res_to_pb(result),
+        };
+        let bytes = ProtoUtils::encode(response)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
+    }
+
+    pub fn get_filesystem_info(&self, env: &mut JNIEnv) -> FsResult<jarray> {
+        let status = self.inner.get_filesystem_info()?;
+        let byte_arr = JavaUtils::new_jarray(env, &status)?;
+        Ok(byte_arr)
+    }
+
+    pub fn get_mount_info(&self, env: &mut JNIEnv, path: JString) -> FsResult<jarray> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let bytes = self.inner.get_mount_info(path)?;
+        let byte_arr = JavaUtils::new_jarray(env, &bytes)?;
+        Ok(byte_arr)
+    }
+
+    pub fn mount(
+        &self,
+        env: &mut JNIEnv,
+        ufs_path: JString,
+        cv_path: JString,
+        options: JByteArray,
+    ) -> FsResult<()> {
+        let ufs_path = JavaUtils::jstring_to_string(env, &ufs_path)?;
+        let cv_path = JavaUtils::jstring_to_string(env, &cv_path)?;
+        let options = env
+            .convert_byte_array(&options)
+            .map_err(FsError::from_error)?;
+        self.inner
+            .mount(ufs_path, cv_path, decode_mount_options(&options)?)
+    }
+
+    pub fn unmount(&self, env: &mut JNIEnv, cv_path: JString) -> FsResult<()> {
+        let cv_path = JavaUtils::jstring_to_string(env, &cv_path)?;
+        self.inner.umount(cv_path)
+    }
+
+    pub fn get_mount_table(&self, env: &mut JNIEnv) -> FsResult<jarray> {
+        let response = GetMountTableResponse {
+            mount_table: self
+                .inner
+                .get_mount_table()?
+                .into_iter()
+                .map(ProtoUtils::mount_info_to_pb)
+                .collect(),
+        };
+        let bytes = ProtoUtils::encode(response)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
+    }
+
+    pub fn toggle_path(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        check_cache: jboolean,
+    ) -> FsResult<jstring> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let ufs_path = self
+            .inner
+            .toggle_path(path, JavaUtils::jbool_to_bool(check_cache))?;
+        let string = JavaUtils::new_jstring(env, ufs_path.map(|x| x.clone_display_path()))?;
+        Ok(string)
+    }
+
+    /// Submit a UFS-to-Curvine load transfer.
+    ///
+    /// `job_id`/`run_id`/`state` come back as serialized
+    /// `SubmitTransferResponse` bytes; the transfer service is the only engine.
+    pub fn submit_load_transfer(
+        &self,
+        env: &mut JNIEnv,
+        source_path: JString,
+        target_path: JString,
+        overwrite: jboolean,
+        replicas: Option<jint>,
+    ) -> FsResult<jarray> {
+        let source = JavaUtils::jstring_to_string(env, &source_path)?;
+        let target = decode_optional_path(env, target_path)?;
+        if let Some(replicas) = replicas {
+            if replicas <= 0 {
+                return err_box!("load replicas must be greater than zero");
+            }
+        }
+        let response = job::submit_load(
+            self.inner.session(),
+            &source,
+            target.as_deref(),
+            JavaUtils::jbool_to_bool(overwrite),
+            replicas,
+        )?;
+        let bytes = ProtoUtils::encode(response)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
+    }
+
+    /// Submit a Curvine-to-UFS export transfer. Existing targets are overwritten.
+    pub fn submit_export_transfer(
+        &self,
+        env: &mut JNIEnv,
+        source_path: JString,
+    ) -> FsResult<jarray> {
+        let source = JavaUtils::jstring_to_string(env, &source_path)?;
+        let response = job::submit_export(self.inner.session(), &source)?;
+        let bytes = ProtoUtils::encode(response)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
+    }
+
+    /// Query a transfer by job id, as serialized `GetTransferStatusResponse` bytes.
+    pub fn get_transfer_status(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jarray> {
+        let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
+        let status = job::get_transfer_status(self.inner.session(), job_id)?;
+        let bytes = ProtoUtils::encode(status)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
+    }
+
+    /// Cancel a transfer by job id.
+    pub fn cancel_transfer(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<()> {
+        let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
+        job::cancel_transfer(self.inner.session(), job_id)
+    }
+
+    /// Retry a terminal transfer, returning the new job id.
+    pub fn retry_transfer(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jstring> {
+        let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
+        let retry_transfer_id = job::retry_transfer(self.inner.session(), job_id)?;
+        JavaUtils::new_jstring(env, Some(retry_transfer_id))
+            .map_err(|e| FsError::common(e.to_string()))
+    }
+
+    pub fn cleanup(&self) {
+        self.inner.cleanup()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_mount_options, decode_set_attr_options};
+
+    #[test]
+    fn rejects_empty_mount_options() {
+        let error = decode_mount_options(&[]).unwrap_err();
+        assert!(error.to_string().contains("mount options cannot be empty"));
+    }
+
+    #[test]
+    fn rejects_empty_set_attr_options() {
+        let error = decode_set_attr_options(&[]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("set attr options cannot be empty"));
+    }
+}

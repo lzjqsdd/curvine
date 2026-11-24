@@ -16,11 +16,19 @@ package io.curvine;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.conf.Configuration;
+import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.File;
 
 public class LibFsTest {
+    @Test
+    public void defaultMasterConnPoolSizeIsOne() throws Exception {
+        FilesystemConf filesystemConf = new FilesystemConf(new Configuration());
+        Assert.assertEquals(1, filesystemConf.master_conn_pool_size);
+        Assert.assertTrue(filesystemConf.toToml().contains("master_conn_pool_size = 1\n"));
+    }
+
     @Test
     public void conf() throws Exception {
         Configuration conf = new Configuration();
@@ -36,6 +44,37 @@ public class LibFsTest {
         assert filesystemConf.io_threads == 12;
         assert filesystemConf.rpc_timeout_ms == 300;
         assert !filesystemConf.short_circuit;
+    }
+
+    @Test
+    public void trimsMasterAddrsWhitespace() throws Exception {
+        Configuration conf = new Configuration();
+        conf.set("fs.cv.master_addrs", "localhost:9001, localhost:9002,localhost:9003");
+        conf.set("fs.cv.io_threads", " 16 ");
+
+        FilesystemConf filesystemConf = new FilesystemConf(conf);
+
+        assert filesystemConf.master_addrs.equals("localhost:9001,localhost:9002,localhost:9003");
+        assert filesystemConf.io_threads == 16;
+    }
+
+    @Test
+    public void namespacedMasterAddrsAreNormalized() throws Exception {
+        // initialize() overwrites constructor master_addrs via getMasterAddrs(authority).
+        // Exercise that helper directly so a revert of normalizeCsv there fails the test.
+        CurvineFileSystem fs = new CurvineFileSystem();
+        Configuration conf = new Configuration();
+        conf.set("fs.cv.ns1.master_addrs", "h1:8995, h2:8995,h3:8995");
+        fs.setConf(conf);
+
+        assert fs.getMasterAddrs("ns1").equals("h1:8995,h2:8995,h3:8995");
+    }
+
+    @Test
+    public void clientHostnameEnvValuesAreTrimmed() {
+        assert FilesystemConf.trimEnvHostname(" 192.0.2.8 \n").equals("192.0.2.8");
+        assert FilesystemConf.trimEnvHostname("  ") == null;
+        assert FilesystemConf.trimEnvHostname(null) == null;
     }
 
     @Test
@@ -56,7 +95,7 @@ public class LibFsTest {
 
     @Test
     public void osVersion() throws Exception {
-        String ver = CurvineNative.getOsVersion("src/test/resources/os-version");
+        String ver = CurvineNativeLibraryResolver.getOsVersion("src/test/resources/os-version");
         System.out.println(ver);
     }
 }

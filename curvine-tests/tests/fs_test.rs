@@ -15,20 +15,20 @@
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_client::ClientMetrics;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_core_error::CommonResult;
+use curvine_error::FsResult;
+use curvine_fs_api::{Path, Reader, Writer};
+use curvine_model::{
     CreateFileOptsBuilder, ListOptions, MkdirOptsBuilder, SetAttrOptsBuilder, StorageState,
     TtlAction,
 };
-use curvine_common::state::{FileLock, LockFlags, LockType};
-use curvine_common::FsResult;
+use curvine_model::{FileLock, LockFlags, LockType};
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_tests::Testing;
 use futures::stream::StreamExt;
 use log::info;
-use orpc::common::LocalTime;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
 use std::sync::Arc;
 
 const PATH: &str = "/fs_test/a.log";
@@ -43,6 +43,27 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     conf.client.write_chunk_size_str = "64B".to_string(); // Update string field
     conf.client.metric_report_enable = true;
 
+    // A file's block size may be overridden independently of the client default.
+    // Verify both remote and short-circuit writers use the file metadata value.
+    let mut override_conf = conf.clone();
+    override_conf.client.block_size = 64;
+    override_conf.client.block_size_str = "64B".to_string();
+    override_conf.client.short_circuit = false;
+    test_file_block_size_override(&testing, &rt, override_conf.clone())?;
+    override_conf.client.short_circuit = true;
+    test_file_block_size_override(&testing, &rt, override_conf)?;
+
+    // Regression: append must commit blocks parked in cache_writers, else the
+    // master's compute_len() != self.len check fails with EIO. block_size = 1KB
+    // makes a hole + append cross block boundaries quickly.
+    let mut append_conf = conf.clone();
+    append_conf.client.block_size = 1024;
+    append_conf.client.block_size_str = "1024B".to_string();
+    append_conf.client.max_cache_block_handles = 4;
+    append_conf.client.short_circuit = false;
+    append_conf.client.replicas = 1;
+    test_append_commits_cached_blocks(&testing, &rt, append_conf)?;
+
     // Test short_circuit = false
     conf.client.short_circuit = false;
     run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
@@ -52,6 +73,107 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
 
     Ok(())
+}
+
+fn test_file_block_size_override(
+    testing: &Testing,
+    rt: &Arc<AsyncRuntime>,
+    conf: ClusterConf,
+) -> FsResult<()> {
+    let short_circuit = conf.client.short_circuit;
+    let opts = CreateFileOptsBuilder::with_conf(&conf.client)
+        .create_parent(true)
+        .block_size(128)
+        .build();
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let path = Path::from_str(format!(
+            "/fs_test/block_size_override_{}.log",
+            short_circuit
+        ))?;
+        let data = vec![0x5a; 192];
+
+        let mut writer = fs.create_with_opts(&path, opts, true).await?;
+        writer.write(&data).await?;
+        writer.complete().await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(status.block_size, 128);
+        assert_eq!(status.len, data.len() as i64);
+
+        let mut reader = fs.open(&path).await?;
+        let mut actual = BytesMut::zeroed(data.len());
+        let read = reader.read_full(&mut actual).await?;
+        reader.complete().await?;
+
+        assert_eq!(read, data.len());
+        assert_eq!(actual.as_ref(), data.as_slice());
+        Ok(())
+    })
+}
+
+/// Regression: appending a new block must first commit blocks parked in
+/// `cache_writers`; otherwise their bytes count toward the client's `self.len`
+/// but stay out of `commit_blocks`, and the master's `compute_len() != self.len`
+/// check fails with EIO ("Complete len is not equal to file len").
+fn test_append_commits_cached_blocks(
+    testing: &Testing,
+    rt: &Arc<AsyncRuntime>,
+    conf: ClusterConf,
+) -> FsResult<()> {
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        let path = Path::from_str("/fs_test/append_omit_uncommitted_cache_block.log")?;
+        let bs = 1024i64;
+        let mut writer = fs.create(&path, true).await?;
+
+        // Write 1K at offset 1K: creates a [0,1K) hole (block0, with_alloc) and
+        // block1 (with_pre, uncommitted). seek(0) drains the writes and parks
+        // block1 into cache_writers.
+        writer.seek(bs).await?;
+        writer.write(&vec![0xAAu8; bs as usize]).await?;
+        writer.seek(0).await?;
+
+        // Seek to EOF (2K): cur_writer becomes None, cache_writers keeps block1.
+        writer.seek(2 * bs).await?;
+
+        // Append at EOF and complete: the append path requests block2 and must
+        // commit block1 first, otherwise the master rejects the length.
+        writer.write(&vec![0xBBu8; 16]).await?;
+        writer.complete().await?;
+
+        // [0,1K)=hole, [1K,2K)=0xAA, [2K,+16)=0xBB.
+        let total = (2 * bs + 16) as usize;
+        let hole = bs as usize;
+        let body = (2 * bs) as usize;
+        let mut reader = fs.open(&path).await?;
+        reader.seek(0).await?;
+        let mut buf = vec![0u8; total];
+        let n = reader.read_full(&mut buf).await?;
+        reader.complete().await?;
+
+        assert_eq!(n, total, "short read: expected {} got {}", total, n);
+        assert!(
+            buf[..hole].iter().all(|&b| b == 0),
+            "hole [0,{}) must be zeros",
+            hole
+        );
+        assert!(
+            buf[hole..body].iter().all(|&b| b == 0xAA),
+            "block1 [{},{}) should be 0xAA",
+            hole,
+            body
+        );
+        assert!(
+            buf[body..].iter().all(|&b| b == 0xBB),
+            "appended block2 [{},{}) should be 0xBB",
+            body,
+            total
+        );
+        Ok(())
+    })
 }
 
 fn run_filesystem_end_to_end_operations_on_cluster(
@@ -91,14 +213,20 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         list_files(&fs).await?;
         println!("list_files done");
 
-        get_master_info(&fs).await?;
-        println!("get_master_info done");
+        get_filesystem_info(&fs).await?;
+        println!("get_filesystem_info done");
 
         add_block(&fs).await?;
         println!("add_block done");
 
         rename2(&fs).await?;
         println!("rename2 done");
+
+        open_file_rename_read_write(&fs).await?;
+        println!("open_file_rename_read_write done");
+
+        open_file_rename_sparse_write(&fs).await?;
+        println!("open_file_rename_sparse_write done");
 
         set_attr_non_recursive(&fs).await?;
         println!("set_attr_non_recursive done");
@@ -410,14 +538,98 @@ async fn rename2(fs: &CurvineFileSystem) -> CommonResult<()> {
     let _ = fs.rename(&src, &dst).await?;
 
     assert!(!(fs.exists(&src).await?));
+    assert!(fs.exists(&dst).await?);
     assert!(
-        fs.exists(&Path::from_str("/fs_test/rename2/rename2.log")?)
+        !fs.exists(&Path::from_str("/fs_test/rename2/rename2.log")?)
             .await?
     );
 
     let res = fs.list_status(&dst).await?;
     println!("{:?}", res);
-    assert_eq!(res.len(), 1);
+    assert_eq!(res.len(), 0);
+
+    Ok(())
+}
+
+async fn open_file_rename_read_write(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let src = Path::from_str("/fs_test/open_rename/write.log")?;
+    let dst = Path::from_str("/fs_test/open_rename/write_renamed.log")?;
+
+    let mut writer = fs.create(&src, true).await?;
+    writer.write("before-".as_bytes()).await?;
+    fs.rename(&src, &dst).await?;
+
+    assert!(!fs.exists(&src).await?);
+    assert!(fs.exists(&dst).await?);
+
+    writer.write("after".as_bytes()).await?;
+    writer.complete().await?;
+
+    let status = fs.get_status(&dst).await?;
+    assert_eq!(status.len, "before-after".len() as i64);
+    assert_eq!(fs.read_string(&dst).await?, "before-after");
+    assert!(fs.open(&src).await.is_err());
+
+    let read_src = Path::from_str("/fs_test/open_rename/read.log")?;
+    let read_dst = Path::from_str("/fs_test/open_rename/read_renamed.log")?;
+    fs.write_string(&read_src, "read-before-rename").await?;
+
+    let mut reader = fs.open(&read_src).await?;
+    fs.rename(&read_src, &read_dst).await?;
+
+    assert!(!fs.exists(&read_src).await?);
+    assert!(fs.exists(&read_dst).await?);
+
+    let mut buffer = BytesMut::zeroed("read-before-rename".len());
+    let bytes_read = reader.read_full(&mut buffer).await?;
+    reader.complete().await?;
+    buffer.truncate(bytes_read);
+    assert_eq!(String::from_utf8(buffer.to_vec())?, "read-before-rename");
+    assert_eq!(fs.read_string(&read_dst).await?, "read-before-rename");
+
+    Ok(())
+}
+
+/// Regression: an open writer retains its original path, while rename moves
+/// the directory entry. A later seek-past-EOF write invokes ResizeFile (and may
+/// assign a sparse block), so those operations must resolve the file by inode
+/// ID instead of the now-stale open-time path.
+async fn open_file_rename_sparse_write(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let src = Path::from_str("/fs_test/open_rename_sparse/temp_shuffle")?;
+    let dst = Path::from_str("/fs_test/open_rename_sparse/shuffle_1_1_0.data")?;
+    let mut writer = fs.create(&src, true).await?;
+
+    fs.rename(&src, &dst).await?;
+    assert!(!fs.exists(&src).await?);
+    assert!(fs.exists(&dst).await?);
+
+    const HOLE_END: i64 = 4096;
+    const PREFIX: &[u8] = b"prefix";
+    const SUFFIX: &[u8] = b"suffix";
+
+    // The write below lands at an offset past EOF, so FsWriterBase::write
+    // triggers the rename-sensitive sparse resize and block assignment paths.
+    writer.seek(HOLE_END).await?;
+    writer.write(SUFFIX).await?;
+    writer.seek(0).await?;
+    writer.write(PREFIX).await?;
+    writer.complete().await?;
+
+    let expected_len = HOLE_END as usize + SUFFIX.len();
+    let status = fs.get_status(&dst).await?;
+    assert_eq!(status.len, expected_len as i64);
+
+    let mut reader = fs.open(&dst).await?;
+    let mut actual = vec![0u8; expected_len];
+    let read = reader.read_full(&mut actual).await?;
+    reader.complete().await?;
+
+    assert_eq!(read, expected_len);
+    assert_eq!(&actual[..PREFIX.len()], PREFIX);
+    assert!(actual[PREFIX.len()..HOLE_END as usize]
+        .iter()
+        .all(|&byte| byte == 0));
+    assert_eq!(&actual[HOLE_END as usize..], SUFFIX);
 
     Ok(())
 }
@@ -465,9 +677,9 @@ async fn add_block(fs: &CurvineFileSystem) -> CommonResult<()> {
     Ok(())
 }
 
-async fn get_master_info(fs: &CurvineFileSystem) -> CommonResult<()> {
-    let res = fs.get_master_info().await?;
-    info!("master info {:#?}", res);
+async fn get_filesystem_info(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let res = fs.get_filesystem_info().await?;
+    info!("filesystem info {:#?}", res);
     Ok(())
 }
 
@@ -562,11 +774,11 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     info!("=== Testing FS Used - Creating files with data ===");
 
     // Get initial state
-    let initial_master_info = fs.get_master_info().await?;
+    let initial_filesystem_info = fs.get_filesystem_info().await?;
     info!(
         "Initial FS Used: {} bytes ({:.2} MB)",
-        initial_master_info.fs_used,
-        initial_master_info.fs_used as f64 / 1024.0 / 1024.0
+        initial_filesystem_info.fs_used,
+        initial_filesystem_info.fs_used as f64 / 1024.0 / 1024.0
     );
 
     // Create files and write data, ensuring data is flushed to storage
@@ -587,15 +799,15 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
         );
 
         // Check status after creating each file
-        let current_info = fs.get_master_info().await?;
+        let current_info = fs.get_filesystem_info().await?;
         info!("After file {}: FS Used = {} bytes", i, current_info.fs_used);
     }
 
     // Wait for storage system to process
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Get master info to check fs_used
-    let after_small_files_info = fs.get_master_info().await?;
+    // Get filesystem info to check fs_used
+    let after_small_files_info = fs.get_filesystem_info().await?;
     info!(
         "After creating small files - FS Used: {} bytes ({:.2} MB)",
         after_small_files_info.fs_used,
@@ -622,35 +834,36 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Wait for storage system to update
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-    // Get master info again
-    let final_master_info = fs.get_master_info().await?;
+    // Get filesystem info again
+    let final_filesystem_info = fs.get_filesystem_info().await?;
     info!(
         "Final FS Used: {} bytes ({:.2} MB)",
-        final_master_info.fs_used,
-        final_master_info.fs_used as f64 / 1024.0 / 1024.0
+        final_filesystem_info.fs_used,
+        final_filesystem_info.fs_used as f64 / 1024.0 / 1024.0
     );
 
     // Output detailed capacity information
     info!("=== Final Capacity Information ===");
     info!(
         "Capacity: {} bytes ({:.2} GB)",
-        final_master_info.capacity,
-        final_master_info.capacity as f64 / 1024.0 / 1024.0 / 1024.0
+        final_filesystem_info.capacity,
+        final_filesystem_info.capacity as f64 / 1024.0 / 1024.0 / 1024.0
     );
     info!(
         "Available: {} bytes ({:.2} GB)",
-        final_master_info.available,
-        final_master_info.available as f64 / 1024.0 / 1024.0 / 1024.0
+        final_filesystem_info.available,
+        final_filesystem_info.available as f64 / 1024.0 / 1024.0 / 1024.0
     );
     info!(
         "FS Used: {} bytes ({:.2} MB)",
-        final_master_info.fs_used,
-        final_master_info.fs_used as f64 / 1024.0 / 1024.0
+        final_filesystem_info.fs_used,
+        final_filesystem_info.fs_used as f64 / 1024.0 / 1024.0
     );
 
     // Calculate non_fs_used
-    let non_fs_used =
-        final_master_info.capacity - final_master_info.available - final_master_info.fs_used;
+    let non_fs_used = final_filesystem_info.capacity
+        - final_filesystem_info.available
+        - final_filesystem_info.fs_used;
     info!(
         "Non-FS Used: {} bytes ({:.2} GB)",
         non_fs_used,
@@ -658,30 +871,34 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     );
 
     // Verify capacity consistency
-    let total_accounted = final_master_info.available + final_master_info.fs_used + non_fs_used;
+    let total_accounted =
+        final_filesystem_info.available + final_filesystem_info.fs_used + non_fs_used;
     info!(
         "Consistency check: {} + {} + {} = {}",
-        final_master_info.available, final_master_info.fs_used, non_fs_used, total_accounted
+        final_filesystem_info.available,
+        final_filesystem_info.fs_used,
+        non_fs_used,
+        total_accounted
     );
-    info!("Expected capacity: {}", final_master_info.capacity);
+    info!("Expected capacity: {}", final_filesystem_info.capacity);
 
-    if total_accounted == final_master_info.capacity {
+    if total_accounted == final_filesystem_info.capacity {
         info!("✅ Capacity consistency check PASSED");
     } else {
         info!(
             "❌ Capacity consistency check FAILED - difference: {}",
-            (total_accounted - final_master_info.capacity).abs()
+            (total_accounted - final_filesystem_info.capacity).abs()
         );
     }
 
     // Verify fs_used is not negative
     assert!(
-        final_master_info.fs_used >= 0,
+        final_filesystem_info.fs_used >= 0,
         "FS Used should not be negative"
     );
 
     // If fs_used is still 0, output debug information but don't fail the test
-    if final_master_info.fs_used == 0 {
+    if final_filesystem_info.fs_used == 0 {
         info!("⚠️  WARNING: FS Used is still 0. This might indicate:");
         info!("   1. Data is not yet committed to block storage");
         info!("   2. Test cluster might be using different storage mechanism");
@@ -689,7 +906,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     } else {
         info!(
             "✅ FS Used has non-zero value: {} bytes",
-            final_master_info.fs_used
+            final_filesystem_info.fs_used
         );
     }
 
@@ -722,9 +939,8 @@ async fn test_metrics(fs: &CurvineFileSystem) -> FsResult<()> {
         .with_label_values(&["id1"])
         .inc_by(200);
 
-    fs.fs_client()
-        .metrics_report(ClientMetrics::encode().unwrap())
-        .await
+    let (metrics, _) = ClientMetrics::encode().unwrap();
+    fs.fs_client().metrics_report(metrics).await
 }
 
 #[test]
@@ -749,6 +965,7 @@ fn set_lock() {
             lock_flags: LockFlags::Plock,
             start: 0,
             end: 100,
+            session_owned: false,
         };
 
         let conflict = fs.set_lock(&file_path, plock_read.clone()).await.unwrap();

@@ -12,28 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::CurvineURI;
-use curvine_common::raft::storage::{AppStorage, ApplyMsg};
-use curvine_common::raft::{NodeId, RaftPeer};
-use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, WorkerInfo,
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_fs_api::CurvineURI;
+use curvine_model::{
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, ExtendedBlock, MountOptions,
+    OpenFlags, RenameFlags, WorkerInfo, WriteType,
 };
-use curvine_common::utils::SerdeUtils;
+use curvine_net::net::NetUtils;
+use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
+use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+use curvine_raft::raft::{NodeId, RaftPeer};
+use curvine_runtime::common::SerdeUtils;
+use curvine_runtime::common::{FileUtils, Logger, TimeSpent, Utils};
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
-use curvine_server::master::journal::{JournalBatch, JournalLoader, JournalSystem};
+use curvine_server::master::journal::{
+    CompleteFileEntry, JournalBatch, JournalEntry, JournalLoader, JournalSystem,
+    ReleaseWriterEntry, UfsLoader,
+};
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use orpc::common::{Logger, TimeSpent};
-use orpc::io::net::NetUtils;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::{err_box, CommonResult};
-use raft::eraftpb::Entry;
+use prost::Message;
+use raft::eraftpb::{ConfChange, Entry, EntryType};
+use raft::StateRole;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
+
+/// Master file counts live in a process-global metrics registry, and every
+/// `JournalSystem` a test creates resets it. Every test in this file builds a
+/// master, so they all take this lock; otherwise a concurrent load resets the
+/// counts under `test_apply_snapshot_refuses_empty_over_populated_files`.
+static METRICS_SENSITIVE_TESTS: Mutex<()> = Mutex::new(());
+
+fn serialize_metrics_sensitive_test() -> MutexGuard<'static, ()> {
+    METRICS_SENSITIVE_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn replay_entries(
     loader: &JournalLoader,
@@ -89,15 +107,217 @@ fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
     let dir = std::env::temp_dir().join(format!(
         "curvine-journal-{name}-{}-{}",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        curvine_runtime::common::LocalTime::mills()
     ));
     std::fs::create_dir_all(&dir)?;
     CurvineURI::new(format!("file://{}/", dir.display()))
 }
 
+#[test]
+fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("promotion-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/committed-before-promotion", false)?;
+    let entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("promotion-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target.fs();
+    let loader = target.journal_loader();
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(entry);
+    target.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+
+    assert!(target_fs.file_status("/committed-before-promotion").is_ok());
+    Ok(())
+}
+
+#[test]
+fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("promotion-noop-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/before-noop", false)?;
+    let metadata_entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+    let expected_op_id = metadata_entry.op_id();
+    let expected_rpc_id = metadata_entry.rpc_id();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("promotion-noop-target-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(metadata_entry);
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    })?;
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 2,
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+
+    // Promotion catches the metadata watermark up but never moves the UFS one:
+    // the owed range belongs to the replayer, which testing mode does not spawn.
+    let state = loader.get_fsm_state();
+    assert_eq!(state.applied.index, 2);
+    assert_eq!(state.applied.op_id, expected_op_id);
+    assert_eq!(state.applied.rpc_id, expected_rpc_id);
+    assert_eq!(
+        state.ufs_applied.index, 0,
+        "metadata catch-up must leave the UFS watermark to the replayer"
+    );
+
+    // Draining the owed range is the replayer's job, driven explicitly here.
+    AsyncRuntime::single().block_on(async { loader.ufs_loader().drain_replay_for_test().await })?;
+    let state = loader.get_fsm_state();
+    assert_eq!(
+        state.ufs_applied.index, state.applied.index,
+        "the drained range must catch the UFS watermark up to applied"
+    );
+    Ok(())
+}
+
+#[test]
+fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("promotion-conf-change-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        entry_type: EntryType::EntryConfChange as i32,
+        data: ConfChange::default().encode_to_vec(),
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+
+    // A configuration entry owes no UFS work, but that does not put the UFS
+    // watermark under metadata apply: it stays at 0 until a replay drains it.
+    let state = loader.get_fsm_state();
+    assert_eq!(state.applied.index, 1);
+    assert_eq!(state.ufs_applied.index, 0);
+
+    AsyncRuntime::single().block_on(async { loader.ufs_loader().drain_replay_for_test().await })?;
+    let state = loader.get_fsm_state();
+    assert_eq!(state.ufs_applied.index, state.applied.index);
+    Ok(())
+}
+
+#[test]
+fn follower_replay_allows_inode_id_below_allocator_watermark() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("duplicate-id-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/source", false)?;
+    let source_entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+    let inode_id = source_entry
+        .allocated_inode_id()
+        .expect("mkdir must allocate an inode id");
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("duplicate-id-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target.fs();
+    // The allocator can advance before a journal operation succeeds. Its
+    // watermark must not prevent replaying an inode that has not been created.
+    let watermark = inode_id + 1;
+    target_fs.fs_dir.read().update_last_inode_id(watermark)?;
+    assert!(target_fs.file_status("/source").is_err());
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(source_entry);
+    let entry = Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    };
+    target.append_committed_entry_for_test(entry.clone())?;
+
+    let loader = target.journal_loader();
+    AsyncRuntime::single()
+        .block_on(loader.apply(true, ApplyMsg::new_scan(AppliedIndex::default())))?;
+    assert!(target_fs.file_status("/source").is_ok());
+    assert_eq!(target_fs.last_inode_id(), watermark);
+    assert_eq!(loader.get_fsm_state().applied.index, 1);
+    Ok(())
+}
+
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
 fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Master::init_test_metrics();
 
     let mut conf = ClusterConf {
@@ -128,7 +348,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     fs_leader.print_tree();
     fs_follower.print_tree();
     assert_eq!(fs_leader.last_inode_id(), fs_follower.last_inode_id());
-    assert_eq!(fs_leader.sum_hash(), fs_follower.sum_hash());
+    assert_eq!(fs_leader.sum_hash()?, fs_follower.sum_hash()?);
 
     let leader_mnt = mnt_mgr1.get_mount_table().unwrap();
     let follower_mnt = mnt_mgr2.get_mount_table().unwrap();
@@ -142,6 +362,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
 // Start 2 masters at the same time to check the correctness of log playback.
 #[test]
 fn test_raft_consensus_and_state_synchronization_between_two_masters() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Logger::default();
     Master::init_test_metrics();
 
@@ -154,6 +375,7 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     conf.journal.writer_flush_batch_size = 1;
     conf.journal.writer_flush_batch_ms = 10;
     conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
     conf.journal.journal_addrs = vec![
         RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
         RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
@@ -210,12 +432,16 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     // the active node, rather than using a fixed sleep that may be insufficient
     // under load. Both inode state and mount table are replicated via separate
     // Raft log entries, so we must wait for all of them to be applied.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
     loop {
         let leader_mnt = mnt_mgr1.get_mount_table().unwrap_or_default();
         let follower_mnt = mnt_mgr2.get_mount_table().unwrap_or_default();
+        let hash_converged = match (active.sum_hash(), standby.sum_hash()) {
+            (Ok(active_hash), Ok(standby_hash)) => active_hash == standby_hash,
+            _ => false,
+        };
         if active.last_inode_id() == standby.last_inode_id()
-            && active.sum_hash() == standby.sum_hash()
+            && hash_converged
             && leader_mnt.len() == follower_mnt.len()
         {
             break;
@@ -224,7 +450,7 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
             active.print_tree();
             standby.print_tree();
             assert_eq!(active.last_inode_id(), standby.last_inode_id());
-            assert_eq!(active.sum_hash(), standby.sum_hash());
+            assert_eq!(active.sum_hash()?, standby.sum_hash()?);
             break;
         }
         thread::sleep(Duration::from_millis(200));
@@ -236,6 +462,152 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     assert_eq!(leader_mnt.len(), follower_mnt.len());
     assert_eq!(leader_mnt[0], follower_mnt[0]);
 
+    Ok(())
+}
+
+/// A single file written block by block under the default op-count batch size
+/// (1000) drives consecutive same-inode `AddBlock` entries into one sender
+/// batch, so the default-on coalescing fold is exercised end to end: the
+/// follower must reconstruct the exact same block list and locations as the
+/// leader through `journal_loader::add_block` replay of the folded record.
+#[test]
+fn test_coalesced_add_block_replays_identically_on_follower() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Logger::default();
+    Master::init_test_metrics();
+
+    let port1 = NetUtils::hold_available_port();
+    let port2 = NetUtils::hold_available_port();
+
+    let mut conf = ClusterConf::default();
+    // Keep the default writer_flush_batch_size so consecutive AddBlock ops of
+    // one file stay in one batch and fold. Only widen the time window so the
+    // whole block-by-block write lands in a single flush interval.
+    conf.journal.writer_flush_batch_ms = 500;
+    conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
+    conf.journal.journal_addrs = vec![
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
+    ];
+    let worker = WorkerInfo::default();
+
+    conf.change_test_meta_dir("coalesce-1");
+    conf.journal.rpc_port = port1;
+    let js1 = JournalSystem::from_conf(&conf).unwrap();
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    fs1.add_test_worker(worker.clone());
+    let fs_monitor1 = js1.master_monitor();
+    let log_store1 = js1.log_store();
+
+    conf.change_test_meta_dir("coalesce-2");
+    conf.journal.rpc_port = port2;
+    let js2 = JournalSystem::from_conf(&conf).unwrap();
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    fs2.add_test_worker(worker.clone());
+    let fs_monitor2 = js2.master_monitor();
+    let log_store2 = js2.log_store();
+
+    js1.start_blocking()?;
+    js2.start_blocking()?;
+
+    let mut wait = 30 * 1000;
+    while wait > 0 {
+        let start = TimeSpent::new();
+        if fs_monitor1.is_active() || fs_monitor2.is_active() {
+            break;
+        }
+        wait -= start.used_ms();
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let (active, standby, active_log) = if fs_monitor1.is_active() {
+        (fs1, fs2, log_store1)
+    } else if fs_monitor2.is_active() {
+        (fs2, fs1, log_store2)
+    } else {
+        return err_box!("Not found active master");
+    };
+
+    run_single_file_multi_block(&active, &worker)?;
+
+    // Poll until the standby converges: every AddBlock op was folded on the
+    // leader and must replay to the identical block list and locations.
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let converged = matches!((active.sum_hash(), standby.sum_hash()), (Ok(a), Ok(s)) if a == s)
+            && active.last_inode_id() == standby.last_inode_id();
+        if converged {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            active.print_tree();
+            standby.print_tree();
+            assert_eq!(active.last_inode_id(), standby.last_inode_id());
+            assert_eq!(active.sum_hash()?, standby.sum_hash()?);
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    assert_eq!(active.sum_hash()?, standby.sum_hash()?);
+
+    // The fold must actually have happened: one create, one folded AddBlock
+    // record and one complete_file are the only journal entries for the
+    // block-by-block write. If the fold were off (or broken), every block
+    // allocation would be its own raft entry and last_index would be ~blocks.
+    let entries = active_log
+        .read()
+        .scan_entries(1, active_log.read().last_index())?;
+    let journal_entries = entries
+        .into_iter()
+        .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+        .count();
+    assert!(
+        journal_entries < 8,
+        "coalescing must fold the consecutive AddBlock ops into one record, \
+         but the leader raft log holds {journal_entries} journal entries"
+    );
+    Ok(())
+}
+
+/// Write one file block by block: every block allocation emits a consecutive
+/// same-inode `AddBlock` journal entry (commit the previous block, append the
+/// next). Under the default op-count batch size these land in one sender batch
+/// and fold.
+fn run_single_file_multi_block(fs: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
+    let address = ClientAddress::default();
+    let path = "/journal/multiblock.log";
+    fs.create(path, true)?;
+
+    let blocks = 10i64;
+    let mut len = 0i64;
+    let mut prev_commit: Option<CommitBlock> = None;
+    let mut last_block: Option<ExtendedBlock> = None;
+    for _ in 0..blocks {
+        let commit_blocks = prev_commit.take().into_iter().collect::<Vec<_>>();
+        let located = fs.add_block(
+            path,
+            None,
+            address.clone(),
+            commit_blocks,
+            vec![],
+            len,
+            last_block,
+        )?;
+        let commit = CommitBlock {
+            block_id: located.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        };
+        len += 10;
+        prev_commit = Some(commit);
+        last_block = Some(located.block);
+    }
+
+    // Complete the last block so the file length covers every block.
+    let last = prev_commit.expect("a committed block");
+    fs.complete_file(path, None, len, vec![last], "", false, None)?;
     Ok(())
 }
 
@@ -253,7 +625,8 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let status = fs_leader.create("/journal/b/test.log", true)?;
 
     // Assign block
-    let block = fs_leader.add_block(&status.path, address.clone(), vec![], vec![], 0, None)?;
+    let block =
+        fs_leader.add_block(&status.path, None, address.clone(), vec![], vec![], 0, None)?;
 
     // Complete the file.
     let commit = CommitBlock {
@@ -261,7 +634,15 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
         block_len: 10,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
     };
-    fs_leader.complete_file(&status.path, 10, vec![commit], &address.client_name, false)?;
+    fs_leader.complete_file(
+        &status.path,
+        None,
+        10,
+        vec![commit],
+        &address.client_name,
+        false,
+        None,
+    )?;
 
     // File renaming
     fs_leader.rename(
@@ -276,13 +657,13 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let path = "/journal/append.log";
     fs_leader.create(path, true)?;
 
-    let block = fs_leader.add_block(path, address.clone(), vec![], vec![], 0, None)?;
+    let block = fs_leader.add_block(path, None, address.clone(), vec![], vec![], 0, None)?;
     let commit = CommitBlock {
         block_id: block.block.id,
         block_len: 10,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
     };
-    fs_leader.complete_file(path, 10, vec![commit], "", false)?;
+    fs_leader.complete_file(path, None, 10, vec![commit], "", false, None)?;
 
     let commit = CommitBlock {
         block_id: block.block.id,
@@ -294,7 +675,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
         CreateFileOpts::with_create(true),
         OpenFlags::new_create(),
     )?;
-    fs_leader.complete_file(path, 13, vec![commit], "", false)?;
+    fs_leader.complete_file(path, None, 13, vec![commit], "", false, None)?;
 
     Ok(())
 }
@@ -335,9 +716,317 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "ufs-loader-mkdir-parent-{}",
+        curvine_runtime::common::LocalTime::mills()
+    ));
+
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let mount_manager = journal_system.mount_manager();
+
+    let ufs_dir = std::env::temp_dir().join(format!(
+        "curvine-ufs-loader-mkdir-{}-{}",
+        std::process::id(),
+        curvine_runtime::common::LocalTime::mills()
+    ));
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    std::fs::create_dir_all(&ufs_dir)?;
+
+    let mount_opts = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    mount_manager.mount(
+        None,
+        "/mnt",
+        format!("file://{}/", ufs_dir.display()).as_ref(),
+        &mount_opts,
+    )?;
+
+    fs.mkdir("/mnt/db/table", true)?;
+    journal_system.fs().fs_dir.read().take_entries();
+
+    fs.mkdir("/mnt/db/table/log", false)?;
+    let mkdir_entry = match journal_system
+        .fs()
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .find_map(|entry| match entry {
+            JournalEntry::Mkdir(e) => Some(e),
+            _ => None,
+        }) {
+        Some(entry) => entry,
+        None => return err_box!("missing mkdir journal entry"),
+    };
+
+    assert!(!ufs_dir.join("db/table").exists());
+
+    let loader = ufs_loader_of(&journal_system);
+    let rt = AsyncRuntime::single();
+    rt.block_on(async { loader.mkdir(&mkdir_entry).await })?;
+
+    assert!(ufs_dir.join("db/table/log").is_dir());
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+
+    Ok(())
+}
+
+fn new_ufs_loader_complete_env(
+    name: &str,
+) -> CommonResult<(
+    ClusterConf,
+    JournalSystem,
+    MasterFilesystem,
+    std::path::PathBuf,
+)> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.journal.ufs_copy_timeout = "2s".to_string();
+    conf.change_test_meta_dir(format!(
+        "ufs-loader-complete-{}-{}",
+        name,
+        curvine_runtime::common::LocalTime::mills()
+    ));
+
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    fs.add_test_worker(WorkerInfo::default());
+
+    let ufs_dir = std::env::temp_dir().join(format!(
+        "curvine-ufs-loader-complete-{}-{}-{}",
+        name,
+        std::process::id(),
+        curvine_runtime::common::LocalTime::mills()
+    ));
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    std::fs::create_dir_all(&ufs_dir)?;
+
+    let mount_opts = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    journal_system.mount_manager().mount(
+        None,
+        "/mnt",
+        format!("file://{}/", ufs_dir.display()).as_ref(),
+        &mount_opts,
+    )?;
+
+    Ok((conf, journal_system, fs, ufs_dir))
+}
+
+/// The UFS loader owned by a test journal system. It carries the replay wiring,
+/// so an export op is replayed through the same view the worker uses.
+fn ufs_loader_of(journal_system: &JournalSystem) -> UfsLoader {
+    journal_system.journal_loader().ufs_loader().clone()
+}
+
+fn take_complete_file_entry(journal_system: &JournalSystem) -> CommonResult<CompleteFileEntry> {
+    match journal_system
+        .fs()
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .find_map(|entry| match entry {
+            JournalEntry::CompleteFile(e) => Some(e),
+            _ => None,
+        }) {
+        Some(entry) => Ok(entry),
+        None => err_box!("missing complete_file journal entry"),
+    }
+}
+
+fn take_release_writer_entry(journal_system: &JournalSystem) -> CommonResult<ReleaseWriterEntry> {
+    match journal_system
+        .fs()
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .find_map(|entry| match entry {
+            JournalEntry::ReleaseWriter(e) => Some(e),
+            _ => None,
+        }) {
+        Some(entry) => Ok(entry),
+        None => err_box!("missing release_writer journal entry"),
+    }
+}
+
+fn collect_ufs_rel_files(dir: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    fn walk(root: &std::path::Path, dir: &std::path::Path, files: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else if let Ok(rel) = path.strip_prefix(root) {
+                files.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    walk(dir, dir, &mut files);
+    files.sort();
+    files
+}
+
+#[test]
+fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("skip-non-mount")?;
+
+    fs.create("/plain.log", true)?;
+    journal_system.fs().fs_dir.read().take_entries();
+    fs.complete_file("/plain.log", None, 0, vec![], "", false, None)?;
+    let entry = take_complete_file_entry(&journal_system)?;
+    let entry_debug = format!("{:?}", entry);
+    assert!(
+        entry_debug.contains("/plain.log"),
+        "journal complete path should be the non-mount request path: {}",
+        entry_debug
+    );
+
+    let loader = ufs_loader_of(&journal_system);
+    let rt = AsyncRuntime::single();
+    rt.block_on(async { loader.complete_file(&entry).await })?;
+
+    assert!(
+        collect_ufs_rel_files(&ufs_dir).is_empty(),
+        "non-mount complete must not create UFS objects: {:?}",
+        collect_ufs_rel_files(&ufs_dir)
+    );
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    Ok(())
+}
+
+// The write-back itself is a transfer now, so proving that the live path wins
+// over the stale journal path needs the embedded transfer service plus a worker.
+// This harness builds a bare `JournalSystem` (no master RPC server, no embedded
+// transfer, no worker), so it cannot run a transfer. Equivalent end-to-end
+// coverage lives in curvine-server/tests/ufs_replay_failover_test.rs and
+// curvine-tests/tests/write_cache_test.rs::test_fs_mode.
+#[test]
+#[ignore = "no live master RPC/embedded transfer/worker in this JournalSystem harness; the fs_mode export path is covered end-to-end by ufs_replay_failover_test and write_cache_test::test_fs_mode"]
+fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("rename-within-mount")?;
+
+    let created = fs.create("/mnt/old.log", true)?;
+    fs.rename("/mnt/old.log", "/mnt/new.log", RenameFlags::empty())?;
+    journal_system.fs().fs_dir.read().take_entries();
+    fs.complete_file("/mnt/old.log", Some(created.id), 0, vec![], "", false, None)?;
+    let entry = take_complete_file_entry(&journal_system)?;
+    let entry_debug = format!("{:?}", entry);
+    assert!(
+        entry_debug.contains("/mnt/old.log"),
+        "journal complete path should keep the original request path: {}",
+        entry_debug
+    );
+    assert!(
+        entry_debug.contains(&format!("id: {}", created.id)),
+        "journal complete entry should carry inode {}: {}",
+        created.id,
+        entry_debug
+    );
+
+    let loader = ufs_loader_of(&journal_system);
+    let rt = AsyncRuntime::single();
+    rt.block_on(async { loader.complete_file(&entry).await })?;
+
+    assert!(
+        !ufs_dir.join("old.log").exists(),
+        "export must not land at the stale journal path"
+    );
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    Ok(())
+}
+
+/// A real `CompleteFile` finalizes the contents and drops every writer record
+/// (`InodeFile::complete`), so the replay export is driven by the complete.
+/// A replayed `ReleaseWriter` stays a fallback: it exports nothing while the
+/// file is unfinished, and once the file is complete it re-submits the export
+/// of the live path.
+///
+/// The export is a transfer now, so the observable the test used to read (the
+/// legacy master job store) is gone, and this harness has no master RPC server,
+/// embedded transfer or worker to execute it. The ordering is covered
+/// end-to-end by ufs_replay_failover_test.rs and write_cache_test::test_fs_mode
+/// instead.
+#[test]
+#[ignore = "no live master RPC/embedded transfer/worker in this JournalSystem harness; the fs_mode export path is covered end-to-end by ufs_replay_failover_test and write_cache_test::test_fs_mode"]
+fn test_ufs_loader_complete_exports_and_release_writer_is_a_fallback() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("release-writer")?;
+
+    let mut opts = CreateFileOpts::with_create(false);
+    opts.client_name = "client-a".to_string();
+    let created = fs.create_with_opts(
+        "/mnt/two-writers.log",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    let ino = created.id;
+
+    let mut open_opts = CreateFileOpts::with_create(false);
+    open_opts.client_name = "client-b".to_string();
+    fs.open_file("/mnt/two-writers.log", open_opts, OpenFlags::new_create())?;
+
+    let loader = ufs_loader_of(&journal_system);
+    let rt = AsyncRuntime::single();
+
+    // A writer that closes without completing releases only its own marker, and
+    // the fallback export stays silent: the file is still unfinished.
+    journal_system.fs().fs_dir.read().take_entries();
+    assert!(fs.release_writer(ino, "client-a")?);
+    let release_entry = take_release_writer_entry(&journal_system)?;
+    rt.block_on(async { loader.release_writer(&release_entry).await })?;
+    assert!(
+        collect_ufs_rel_files(&ufs_dir).is_empty(),
+        "no UFS object may appear for an unfinished file: {:?}",
+        collect_ufs_rel_files(&ufs_dir)
+    );
+
+    journal_system.fs().fs_dir.read().take_entries();
+    fs.complete_file(
+        "/mnt/two-writers.log",
+        Some(ino),
+        0,
+        vec![],
+        "client-b",
+        false,
+        None,
+    )?;
+    let complete_entry = take_complete_file_entry(&journal_system)?;
+    let _complete_export = rt.block_on(async { loader.complete_file(&complete_entry).await });
+
+    // Replaying the release after the complete is the fallback path.
+    let _fallback = rt.block_on(async { loader.release_writer(&release_entry).await });
+
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    Ok(())
+}
+
 // Test snapshot restart
 #[test]
 fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Logger::default();
     Master::init_test_metrics();
     let mut conf = ClusterConf {
@@ -381,5 +1070,118 @@ fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     drop(mnt_mgr);
     js.shutdown();
 
+    Ok(())
+}
+
+fn empty_checkpoint_snapshot(empty_dir: &str) -> SnapshotData {
+    let fsm_state = FsmState {
+        applied: AppliedIndex {
+            term: 1,
+            index: 1,
+            op_id: 0,
+            rpc_id: 0,
+        },
+        ufs_applied: AppliedIndex {
+            term: 1,
+            index: 1,
+            op_id: 0,
+            rpc_id: 0,
+        },
+    };
+    SnapshotData {
+        snapshot_id: 1,
+        node_id: 1,
+        create_time: 0,
+        bytes_data: None,
+        files_data: Some(SnapshotFileList {
+            dir: empty_dir.to_string(),
+            files: vec![],
+        }),
+        fsm_state,
+    }
+}
+
+// Only the zero-index no-snapshot placeholder is harmless. Every other empty
+// checkpoint must be refused over existing metadata, including directories.
+#[test]
+fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Logger::default();
+    Master::init_test_metrics();
+
+    let test_id = Utils::rand_str(8);
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("meta-empty-snap-refuse-{}", test_id));
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+    fs.add_test_worker(WorkerInfo::default());
+    let loader = js.journal_loader();
+    let rt = AsyncRuntime::single();
+
+    // Directories are metadata too and must not be replaced by an empty checkpoint.
+    fs.mkdir("/only-dirs/nested", true)?;
+    let (dir_count, file_count) = fs.get_file_counts();
+    assert!(
+        dir_count > 0,
+        "expected dirs after mkdir, got {}",
+        dir_count
+    );
+    assert_eq!(file_count, 0);
+
+    let empty_dirs = Utils::test_sub_dir(format!("empty-snap-dirs-{}", test_id));
+    FileUtils::create_dir(&empty_dirs, true)?;
+    assert_eq!(FileUtils::dir_size(&empty_dirs).unwrap_or(1), 0);
+
+    let err = rt
+        .block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_dirs)))
+        .expect_err("empty snapshot over populated directories must be refused");
+    assert!(err.to_string().contains("refusing to apply empty snapshot"));
+
+    // Rebuild a populated FS with files: empty checkpoint must be refused.
+    fs.mkdir("/with-files", true)?;
+    fs.create("/with-files/file.log", false)?;
+    let (_, file_count) = fs.get_file_counts();
+    assert!(file_count > 0, "expected files after create");
+
+    rt.block_on(loader.apply_snapshot(SnapshotData::default()))?;
+    assert!(
+        fs.exists("/with-files/file.log")?,
+        "default empty placeholder snapshot must not wipe populated metadata"
+    );
+
+    let non_placeholder = SnapshotData {
+        snapshot_id: 2,
+        ..Default::default()
+    };
+    let err = rt
+        .block_on(loader.apply_snapshot(non_placeholder))
+        .expect_err("non-placeholder empty snapshot must be refused");
+    assert!(err.to_string().contains("refusing to apply empty snapshot"));
+
+    let empty_files = Utils::test_sub_dir(format!("empty-snap-files-{}", test_id));
+    FileUtils::create_dir(&empty_files, true)?;
+    assert_eq!(FileUtils::dir_size(&empty_files).unwrap_or(1), 0);
+
+    let err = rt
+        .block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_files)))
+        .expect_err("empty snapshot over populated files must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("refusing to apply empty snapshot"),
+        "unexpected error: {}",
+        msg
+    );
+    assert!(
+        msg.contains("files") && msg.contains("dirs"),
+        "error should report filesystem counts; got: {}",
+        msg
+    );
+
+    drop(fs);
+    js.shutdown();
     Ok(())
 }

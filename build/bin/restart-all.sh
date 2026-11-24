@@ -18,7 +18,106 @@
 # Get the absolute path to the directory where the script is located
 BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 
+# Where launch-process.sh writes the pid files. Needed to notice a standalone
+# transfer left over from before the config moved to embedded mode.
+LOG_DIR="${CURVINE_LOG_DIR:-${CURVINE_HOME:-${BIN_DIR}/..}/logs}"
+
 # Close all services and restart.
+
+read_rpc_port() {
+    local section=$1
+    local default_port=$2
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-cluster.toml}"
+
+    if [ ! -f "$conf_file" ]; then
+        echo "$default_port"
+        return
+    fi
+
+    awk -v section="[$section]" -v default_port="$default_port" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == section)
+        }
+        in_section && /^[[:space:]]*rpc_port[[:space:]]*=/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/^[^=]*=/, "", line)
+            gsub(/[[:space:]"]/, "", line)
+            if (line != "") {
+                print line
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print default_port
+            }
+        }
+    ' "$conf_file"
+}
+
+# Print a scalar `key = value` from the given [section] with whitespace and
+# quotes stripped, or default_value when the key (or the file) is absent.
+read_str() {
+    local section=$1
+    local key=$2
+    local default_value=$3
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-cluster.toml}"
+
+    if [ ! -f "$conf_file" ]; then
+        echo "$default_value"
+        return
+    fi
+
+    awk -v section="[$section]" -v key="$key" -v default_value="$default_value" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == section)
+        }
+        in_section {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]\"]/, "", line)
+            if (line ~ "^" key "=") {
+                sub(/^[^=]*=/, "", line)
+                print line
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print default_value
+            }
+        }
+    ' "$conf_file"
+}
+
+# The transfer service runs embedded inside the master by default and needs no
+# extra process. Only the standalone deployment gets one, selected either
+# explicitly with `transfer.mode = "standalone"` or implicitly by a non-empty
+# `transfer.endpoints` list.
+transfer_standalone() {
+    local mode endpoints
+
+    mode="$(read_str "transfer" "mode" "")"
+    if [ "$mode" = "standalone" ]; then
+        return 0
+    fi
+
+    endpoints="$(read_str "transfer" "endpoints" "")"
+    if [ -z "$endpoints" ] || [ "$endpoints" = "[]" ]; then
+        return 1
+    fi
+
+    return 0
+}
 
 # Function to wait for a process to start
 wait_for_process() {
@@ -40,19 +139,88 @@ wait_for_process() {
     return 1
 }
 
-umount -l /curvine-fuse
-pkill -9 -f "curvine"
+wait_for_port() {
+    local service_name=$1
+    local port=$2
+    local timeout=${3:-60}
+    local count=0
 
-# Wait a moment for processes to be killed
-sleep 3
+    echo "Waiting for $service_name RPC port $port..."
+    while [ $count -lt $timeout ]; do
+        if command -v nc >/dev/null 2>&1; then
+            if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+                echo "$service_name RPC port $port is ready"
+                return 0
+            fi
+        elif command -v ss >/dev/null 2>&1; then
+            if ss -ltn "( sport = :$port )" | grep -q ":$port"; then
+                echo "$service_name RPC port $port is ready"
+                return 0
+            fi
+        else
+            echo "Warning: neither nc nor ss is available; only process start was verified"
+            return 0
+        fi
 
-# Start master and worker services
-${BIN_DIR}/curvine-master.sh start
-${BIN_DIR}/curvine-worker.sh start
+        if ! ps -ef | grep "curvine" | grep "$service_name" | grep -v grep > /dev/null; then
+            echo "Error: $service_name exited before RPC port $port became ready"
+            tail -80 "${LOG_DIR}/${service_name}.out" 2>/dev/null || true
+            return 1
+        fi
+
+        sleep 1
+        count=$((count + 1))
+    done
+
+    echo "Error: $service_name RPC port $port did not become ready within $timeout seconds"
+    tail -80 "${CURVINE_LOG_DIR:-${BIN_DIR}/../logs}/${service_name}.out" 2>/dev/null || true
+    return 1
+}
+
+# Stop only the services this script manages, in reverse start order. Each
+# service's stop goes through launch-process.sh, which signals just the PID
+# recorded in that service's pid file. The previous `pkill -9 -f "curvine"`
+# killed every process whose command line mentioned curvine: an editor with a
+# file open in a curvine checkout, a tail on a log, another deployment on the
+# same host.
+"${BIN_DIR}/curvine-fuse.sh" stop
+# The fuse daemon usually unmounts during its graceful stop; drop a leftover
+# lazy mount so the start below does not refuse the existing mountpoint
+# (see prepare_mount_path in curvine-fuse.sh).
+umount -l /curvine-fuse 2>/dev/null || true
+# The transfer service may still be running standalone even though the config
+# now selects embedded mode: it was started (and left behind) by an earlier
+# deployment. Its pid file is enough to know it must be stopped; the start side
+# below stays gated on the config, so it is not started again.
+if transfer_standalone || [ -f "$LOG_DIR/transfer.pid" ]; then
+    "${BIN_DIR}/curvine-transfer.sh" stop
+fi
+"${BIN_DIR}/curvine-worker.sh" stop
+"${BIN_DIR}/curvine-master.sh" stop
+
+MASTER_PORT=$(read_rpc_port "master" 8995)
+WORKER_PORT=$(read_rpc_port "worker" 8997)
+TRANSFER_PORT=$(read_rpc_port "transfer" 9010)
+
+# Start master and worker services. A failed start must abort: when a service
+# keeps running without a pid file (started by hand, pid file deleted), the
+# stop above leaves it alone and wait_for_process/wait_for_port would find
+# that old process and report success for the old binary.
+${BIN_DIR}/curvine-master.sh start || exit 1
+wait_for_process "master" || exit 1
+wait_for_port "master" "$MASTER_PORT" 180 || exit 1
+
+${BIN_DIR}/curvine-worker.sh start || exit 1
 
 # Wait for master and worker to start
-wait_for_process "master"
-wait_for_process "worker"
+wait_for_process "worker" || exit 1
+wait_for_port "worker" "$WORKER_PORT" 60 || exit 1
+
+if transfer_standalone; then
+    ${BIN_DIR}/curvine-transfer.sh start || exit 1
+    wait_for_process "transfer" || exit 1
+    wait_for_port "transfer" "$TRANSFER_PORT" 60 || exit 1
+fi
 
 # Start fuse service
-${BIN_DIR}/curvine-fuse.sh start
+${BIN_DIR}/curvine-fuse.sh start || exit 1

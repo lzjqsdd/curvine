@@ -33,6 +33,7 @@ source "$SCRIPT_DIR/colors.sh"
 TEST_DIR="/curvine-fuse/fuse-test"
 CLEANUP="1"  # Cleanup test files by default
 JSON_OUTPUT=""  # JSON output file path (empty = disabled)
+RUN_EXTENDED="0"  # Run extended tests (FUSE hot reload, git clone); 0=disabled by default
 
 # Test results tracking
 TOTAL_TESTS=0
@@ -44,6 +45,39 @@ FAILED_CMD_LIST=()
 # JSON test results tracking
 JSON_TEST_RESULTS=()
 CURRENT_TEST_GROUP=""
+
+# Require a non-empty option value (rejects missing or next-flag-looking args).
+require_arg() {
+    local opt="$1"
+    local val="$2"
+    if [ -z "$val" ] || [[ "$val" == -* ]]; then
+        echo "Error: $opt requires a value" >&2
+        print_help
+        exit 1
+    fi
+}
+
+# Require option value to be exactly 0 or 1.
+require_01() {
+    local opt="$1"
+    local val="$2"
+    require_arg "$opt" "$val"
+    if [ "$val" != "0" ] && [ "$val" != "1" ]; then
+        echo "Error: $opt must be 0 or 1, got: $val" >&2
+        print_help
+        exit 1
+    fi
+}
+
+# Record an explicit SKIP entry for JSON regression reports.
+record_json_skip() {
+    local test_group="$1"
+    local test_name="$2"
+    local reason="${3:-skipped}"
+    if [ -n "$JSON_OUTPUT" ]; then
+        JSON_TEST_RESULTS+=("SKIP|$test_group|$test_name||$reason")
+    fi
+}
 
 # Print functions
 print_help() {
@@ -61,6 +95,16 @@ This script tests basic filesystem operations including:
   - Pwrite visibility (file size and content after pwrite)
   - POSIX rename semantics (EISDIR, ENOTEMPTY, EINVAL)
   - Mmap read/write (MAP_SHARED mmap ↔ pread coherence, issue #850)
+  - Active-writer path truncate regression (PR #962)
+  - Read-only open with O_CREAT creates a missing file
+  - Mode 0000 is preserved by chmod, fchmod, and umask-filtered create
+  - Overlong lookup names return ENAMETOOLONG
+  - Files created in setgid directories inherit the parent group
+  - Symlink owner and group metadata
+
+Extended tests (disabled by default, enable with --extended 1):
+  - FUSE hot reload: SIGUSR1 restart keeps open file handles and data intact
+  - Git clone: cloning a repository and running git status
 
 For FIO performance tests, use fio-test.sh instead.
 
@@ -68,6 +112,8 @@ OPTIONS:
     -t, --test-dir PATH       Test directory path (default: /curvine-fuse/fuse-test)
         --cleanup <0|1>       Cleanup test files after completion (default: 1)
                               0=keep files, 1=cleanup files
+    -e, --extended <0|1>     Run extended tests (FUSE hot reload, git clone) (default: 0)
+                              0=skip extended tests, 1=run extended tests
         --json-output PATH    Output test results to JSON file (for regression testing)
     -h, --help                Show this help message
 
@@ -83,6 +129,9 @@ EXAMPLES:
     
     # Output results to JSON file for regression testing
     $0 --json-output /tmp/fuse-test-results.json
+
+    # Run extended tests (FUSE hot reload and git clone)
+    $0 --extended 1
 
 EOF
 }
@@ -793,7 +842,8 @@ generate_json_report() {
         echo "  \"timestamp\": \"$timestamp\","
         echo "  \"test_config\": {"
         echo "    \"test_dir\": \"$(json_escape "$TEST_DIR")\","
-        echo "    \"cleanup\": \"$CLEANUP\""
+        echo "    \"cleanup\": \"$CLEANUP\","
+        echo "    \"extended\": \"$RUN_EXTENDED\""
         echo "  },"
         echo "  \"summary\": {"
         echo "    \"total_tests\": $TOTAL_TESTS,"
@@ -824,6 +874,10 @@ generate_json_report() {
             
             if [ "$status" = "FAIL" ] && [ -n "$error_msg" ]; then
                 echo -n ",\"error\": \"$(json_escape "$error_msg")\""
+            fi
+
+            if [ "$status" = "SKIP" ] && [ -n "$error_msg" ]; then
+                echo -n ",\"reason\": \"$(json_escape "$error_msg")\""
             fi
             
             echo -n "}"
@@ -906,6 +960,44 @@ test_fallocate() {
     else
         handle_error "Failed to allocate space" "$cmd"
         return
+    fi
+
+    # Test 2: A non-zero offset past EOF extends the logical file size.
+    local range_file="$TEST_DIR/fallocate_offset_test.txt"
+    local initial_size=4096
+    local range_len=4096
+    truncate -s "$initial_size" "$range_file"
+    print_test "Allocating a range from a non-zero EOF offset"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    cmd="fallocate -o $initial_size -l $range_len $range_file"
+    print_command "$cmd"
+    if eval "$cmd"; then
+        file_size=$(stat -f%z "$range_file" 2>/dev/null || stat -c%s "$range_file")
+        if [ "$file_size" -eq $((initial_size + range_len)) ]; then
+            print_success "Non-zero-offset fallocate extended the file successfully"
+        else
+            handle_error "Non-zero-offset fallocate returned the wrong size: $file_size" "$cmd"
+        fi
+    else
+        handle_error "Non-zero-offset fallocate failed" "$cmd"
+    fi
+
+    # Test 3: KEEP_SIZE accepts the same range without exposing a larger st_size.
+    local keep_size_file="$TEST_DIR/fallocate_keep_size_test.txt"
+    truncate -s "$initial_size" "$keep_size_file"
+    print_test "Allocating a non-zero-offset range with KEEP_SIZE"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    cmd="fallocate -n -o $initial_size -l $range_len $keep_size_file"
+    print_command "$cmd"
+    if eval "$cmd"; then
+        file_size=$(stat -f%z "$keep_size_file" 2>/dev/null || stat -c%s "$keep_size_file")
+        if [ "$file_size" -eq "$initial_size" ]; then
+            print_success "KEEP_SIZE preserved the logical file size"
+        else
+            handle_error "KEEP_SIZE changed the file size to $file_size" "$cmd"
+        fi
+    else
+        handle_error "KEEP_SIZE fallocate failed" "$cmd"
     fi
 }
 
@@ -1271,7 +1363,7 @@ PYTHON_SCRIPT
     rm -f "$test_file" 2>/dev/null || true
 }
 
-# Test 15: FUSE hot reload test
+# Test 15: FUSE hot reload (restart) test
 test_fuse_reload() {
     CURRENT_TEST_GROUP="Test 15: FUSE Hot Reload"
     print_header "$CURRENT_TEST_GROUP"
@@ -1332,6 +1424,9 @@ test_mmap() {
     run_python_script_test \
         "Testing MAP_SHARED mmap write visible to pread after cache-miss open" \
         "mmap_test.py" --dir "$TEST_DIR"
+    run_python_script_test \
+        "Testing mmap read after write and fchmod does not raise SIGBUS" \
+        "curvine_ltp_mmap_sigbus_repro.py" --dir "$TEST_DIR"
 }
 
 # Test 18: Pwrite visibility test
@@ -1357,6 +1452,60 @@ test_file_handle_at() {
     run_python_script_test \
         "Testing name_to_handle_at / open_by_handle_at (exportfs handle round-trip)" \
         "file_handle_at_test.py" --dir "$TEST_DIR"
+}
+
+# Test 21: active writer path truncate regression
+test_pr962_active_writer_truncate() {
+    CURRENT_TEST_GROUP="Test 21: Active Writer Path Truncate"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing fh-less path truncate routes through active writer (PR #962)" \
+        "pr962_active_writer_truncate_repro.py" --dir "$TEST_DIR"
+}
+
+# Test 22: O_CREAT with read-only access still creates the file
+test_open_creat_rdonly() {
+    CURRENT_TEST_GROUP="Test 22: Open Create ReadOnly"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing open(path, O_CREAT|O_RDONLY) creates a missing file" \
+        "open_creat_rdonly_repro.py" --dir "$TEST_DIR"
+}
+
+# Test 23: mode 0000 is a valid persisted permission mode
+test_mode_zero_permissions() {
+    CURRENT_TEST_GROUP="Test 23: Mode Zero Permissions"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing chmod/fchmod/umask preserve mode 0000" \
+        "mode_zero_permissions_repro.py" --dir "$TEST_DIR"
+}
+
+# Test 24: lookup of an overlong name returns ENAMETOOLONG
+test_lookup_enametoolong() {
+    CURRENT_TEST_GROUP="Test 24: Lookup ENAMETOOLONG"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing lookup on overlong names returns ENAMETOOLONG" \
+        "lookup_enametoolong_repro.py" --dir "$TEST_DIR"
+}
+
+# Test 25: files created in setgid directories inherit the parent group
+test_setgid_group_inherit() {
+    CURRENT_TEST_GROUP="Test 25: Setgid Group Inheritance"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing file group inheritance in setgid directories" \
+        "setgid_group_inherit_repro.py" --dir "$TEST_DIR"
+}
+
+# Test 26: symlink owner/group metadata
+test_symlink_owner() {
+    CURRENT_TEST_GROUP="Test 26: Symlink Owner"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing symlink owner and group metadata" \
+        "symlink_owner_repro.py" --dir "$TEST_DIR"
 }
 
 # Print final report
@@ -1408,14 +1557,22 @@ main() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             -t|--test-dir)
+                require_arg "$1" "${2-}"
                 TEST_DIR="$2"
                 shift 2
                 ;;
             --cleanup)
+                require_01 "$1" "${2-}"
                 CLEANUP="$2"
                 shift 2
                 ;;
+            -e|--extended)
+                require_01 "$1" "${2-}"
+                RUN_EXTENDED="$2"
+                shift 2
+                ;;
             --json-output)
+                require_arg "$1" "${2-}"
                 JSON_OUTPUT="$2"
                 shift 2
                 ;;
@@ -1435,6 +1592,7 @@ main() {
     
     echo "Test Directory: $TEST_DIR"
     echo "Cleanup Files:  $([ "$CLEANUP" = "1" ] && echo "Enabled" || echo "Disabled")"
+    echo "Extended Tests: $([ "$RUN_EXTENDED" = "1" ] && echo "Enabled" || echo "Disabled")"
     if [ -n "$JSON_OUTPUT" ]; then
         echo "JSON Output:    $JSON_OUTPUT"
     fi
@@ -1459,13 +1617,31 @@ main() {
     test_file_locks
     test_delayed_delete
     test_python_high_frequency_write
-    test_fuse_reload
+    if [ "$RUN_EXTENDED" = "1" ]; then
+        test_fuse_reload
+    else
+        print_info "Extended test skipped (FUSE hot reload). Use --extended 1 to enable"
+        record_json_skip "Test 15: FUSE Hot Reload" "Testing FUSE hot reload functionality" \
+            "skipped; use --extended 1"
+    fi
     test_mmap
     test_pwrite_visibility
     test_rename
     test_file_handle_at
+    test_pr962_active_writer_truncate
+    test_open_creat_rdonly
+    test_mode_zero_permissions
+    test_lookup_enametoolong
+    test_setgid_group_inherit
+    test_symlink_owner
 
-    test_git_clone
+    if [ "$RUN_EXTENDED" = "1" ]; then
+        test_git_clone
+    else
+        print_info "Extended test skipped (git clone). Use --extended 1 to enable"
+        record_json_skip "Test 16: Git Clone Operations" "Git clone operations" \
+            "skipped; use --extended 1"
+    fi
 
     print_info "All test functions completed"
 

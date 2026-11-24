@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use curvine_client::file::{FsClient, FsContext};
-use curvine_common::fs::CurvineURI;
-use curvine_common::state::MountOptions;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::CurvineURI;
+use curvine_model::MountOptions;
+use curvine_runtime::common::Logger;
+use curvine_runtime::runtime::RpcRuntime;
 use curvine_server::common::ufs_manager::UfsManager;
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::Logger;
-use orpc::runtime::RpcRuntime;
-use orpc::CommonResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -28,6 +28,17 @@ use std::sync::Arc;
 #[test]
 fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
     Logger::default();
+
+    // Credentials are never committed to the repository, see get_s3_test_config.
+    // Without them there is nothing to mount, so skip instead of failing.
+    let s3_config = match get_s3_test_config() {
+        Ok(config) => config,
+        Err(missing) => {
+            println!("skipping test_mount_umount_s3_hdfs_and_path_mapping: {missing} not set");
+            return Ok(());
+        }
+    };
+
     // Create a test cluster configuration
     let testing = Testing::builder().default().build()?;
     testing.start_cluster()?;
@@ -82,29 +93,30 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
             assert!(umount_resp.is_ok(), "{}", umount_resp.unwrap_err());
         }
 
-        let configs = get_s3_test_config().await;
-        let mnt_opt = MountOptions::builder().set_properties(configs).build();
-        let mount_resp = client.mount(&s3_path, &s3_mnt_path, mnt_opt.clone()).await;
+        let s3_mnt_opt = MountOptions::builder().set_properties(s3_config).build();
+        let mount_resp = client
+            .mount(&s3_path, &s3_mnt_path, s3_mnt_opt.clone())
+            .await;
         info!("S3 MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success");
 
         let mount_resp = client
-            .mount(&s3_path7, &s3_mnt_path7, mnt_opt.clone())
+            .mount(&s3_path7, &s3_mnt_path7, s3_mnt_opt.clone())
             .await;
         info!("S3 MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success",);
 
         let configs = get_hdfs_test_config().await;
-        let mnt_opt = MountOptions::builder().set_properties(configs).build();
+        let hdfs_mnt_opt = MountOptions::builder().set_properties(configs).build();
         let mount_resp = client
-            .mount(&hdfs_path, &hdfs_mnt_path, mnt_opt.clone())
+            .mount(&hdfs_path, &hdfs_mnt_path, hdfs_mnt_opt.clone())
             .await;
         info!("Hdfs MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success");
 
         // forbidden mount to root
         let mount_resp = client
-            .mount(&hdfs_path2, &hdfs_mnt_path2, mnt_opt.clone())
+            .mount(&hdfs_path2, &hdfs_mnt_path2, hdfs_mnt_opt.clone())
             .await;
         info!("Hdfs MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "mount should failed");
@@ -134,36 +146,38 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
         info!("target_path: {:?}", target_path);
 
         // monut s3 again
-        let mount_resp = client.mount(&s3_path, &s3_mnt_path, mnt_opt.clone()).await;
-        info!("MountResp: {:?}", mount_resp);
-        assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
-
         let mount_resp = client
-            .mount(&s3_path2, &s3_mnt_path2, mnt_opt.clone())
+            .mount(&s3_path, &s3_mnt_path, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
         let mount_resp = client
-            .mount(&s3_path3, &s3_mnt_path3, mnt_opt.clone())
+            .mount(&s3_path2, &s3_mnt_path2, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
         let mount_resp = client
-            .mount(&s3_path4, &s3_mnt_path4, mnt_opt.clone())
+            .mount(&s3_path3, &s3_mnt_path3, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
         let mount_resp = client
-            .mount(&s3_path5, &s3_mnt_path5, mnt_opt.clone())
+            .mount(&s3_path4, &s3_mnt_path4, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
         let mount_resp = client
-            .mount(&s3_path6, &s3_mnt_path6, mnt_opt.clone())
+            .mount(&s3_path5, &s3_mnt_path5, s3_mnt_opt.clone())
+            .await;
+        info!("MountResp: {:?}", mount_resp);
+        assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
+
+        let mount_resp = client
+            .mount(&s3_path6, &s3_mnt_path6, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "{}", "mount should success");
@@ -216,26 +230,63 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
     })
 }
 
-async fn get_s3_test_config() -> HashMap<String, String> {
-    let mut config = HashMap::new();
+const S3_ENV_ENDPOINT: &str = "MOUNT_TEST_S3_ENDPOINT";
+const S3_ENV_REGION: &str = "MOUNT_TEST_S3_REGION";
+const S3_ENV_ACCESS_KEY: &str = "MOUNT_TEST_S3_ACCESS_KEY";
+const S3_ENV_SECRET_KEY: &str = "MOUNT_TEST_S3_SECRET_KEY";
 
-    // Configuration of MinIO as S3 compatible service
-    config.insert(
-        "s3.endpoint_url".to_string(),
-        "http://s3v2.dg-access-test.wanyol.com".to_string(),
-    );
-    config.insert("s3.region_name".to_string(), "cn-south-1".to_string());
-    config.insert(
-        "s3.credentials.access".to_string(),
-        "T6A4jOFA9TssTrn2K1A6pFDT-xwFiFQbfS2JxZ5D".to_string(),
-    );
-    config.insert(
-        "s3.credentials.secret".to_string(),
-        "4ewVYsv5MFn2KPd6oYmKRQgMCz22LSlqF0Zl2KZz".to_string(),
-    );
-    config.insert("s3.path_style".to_string(), "true".to_string());
+/// Build the S3 compatible (MinIO or object storage) test configuration from the
+/// environment. Credentials must never be committed to the repository:
+///
+/// ```bash
+/// export MOUNT_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+/// export MOUNT_TEST_S3_REGION=cn-south-1
+/// export MOUNT_TEST_S3_ACCESS_KEY=...
+/// export MOUNT_TEST_S3_SECRET_KEY=...
+/// cargo test -p curvine-tests --test mount_test
+/// ```
+///
+/// Returns the missing variable names when the credential pair is incomplete, so the
+/// skip notice points at the variable the caller actually has to export.
+fn get_s3_test_config() -> Result<HashMap<String, String>, String> {
+    match (env_value(S3_ENV_ACCESS_KEY), env_value(S3_ENV_SECRET_KEY)) {
+        (Some(access), Some(secret)) => {
+            let mut config = HashMap::new();
+            config.insert(
+                "s3.endpoint_url".to_string(),
+                std::env::var(S3_ENV_ENDPOINT)
+                    .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string()),
+            );
+            config.insert(
+                "s3.region_name".to_string(),
+                std::env::var(S3_ENV_REGION).unwrap_or_else(|_| "us-east-1".to_string()),
+            );
+            config.insert("s3.credentials.access".to_string(), access);
+            config.insert("s3.credentials.secret".to_string(), secret);
+            config.insert("s3.path_style".to_string(), "true".to_string());
 
-    config
+            Ok(config)
+        }
+        (access, secret) => {
+            let missing: Vec<&str> = [
+                (S3_ENV_ACCESS_KEY, access.is_none()),
+                (S3_ENV_SECRET_KEY, secret.is_none()),
+            ]
+            .into_iter()
+            .filter(|(_, is_missing)| *is_missing)
+            .map(|(name, _)| name)
+            .collect();
+
+            Err(missing.join(" and "))
+        }
+    }
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn get_hdfs_test_config() -> HashMap<String, String> {

@@ -12,66 +12,113 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::fs::dcache::DirTree;
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
-use crate::fs::state::{NodeAttr, NodeMap};
-use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
+use crate::fs::state::{DirTreeLock, DirTreeReadGuard, DirTreeWriteGuard};
+use crate::fs::{FuseReader, FuseWriter};
+use crate::fuse_metrics::{
+    StateStageTimer, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT, CACHE_STATUS,
+    INVAL_REASON_RMDIR, STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP,
+    STATE_STAGE_DIR_HANDLES, STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
+};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
-    err_fuse, FuseMetrics, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC,
-    STATE_FILE_VERSION,
+    err_fuse, FuseError, FuseMetrics, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR,
+    FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
-use curvine_client::file::FsReader;
-use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
-use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
-use curvine_common::fs::{FileSystem, ListStream, MetaCache, Path, StateReader, StateWriter};
-use curvine_common::state::{CreateFileOpts, FileBlocks, FileStatus, ListOptions, OpenFlags};
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_config::ClusterConf;
+use curvine_config::{ClientConf, FuseConf};
+use curvine_core_error::err_box;
+use curvine_error::{FsError, FsResult};
+use curvine_fs_api::{FileSystem, ListStream, Path};
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_model::{
+    CreateFileOpts, DeleteResult, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags,
+    RenameFlags, SetAttrOpts,
+};
+use curvine_runtime::common::{FastHashMap, LocalTime};
+use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
 use futures::stream::{self, StreamExt};
-use log::{error, info, warn};
-use orpc::common::FastHashMap;
-use orpc::err_box;
-use orpc::sync::{AtomicCounter, RwLockHashMap};
-use orpc::sys::RawPtr;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tokio::sync::Mutex;
+use log::{debug, error, info, warn};
+use std::borrow::Cow;
+use std::sync::Arc;
+
+#[derive(Clone, Copy)]
+struct ProbeSnapshot {
+    child: Option<u64>,
+    nlink: Option<u32>,
+}
+
+enum StatProbe {
+    Hit(FileStatus),
+    Miss { path: Path, snapshot: ProbeSnapshot },
+}
+
+struct DotTarget<'a> {
+    ino: u64,
+    name: Cow<'a, str>,
+    root_status: Option<FileStatus>,
+}
+
+/// Outcome of one `NodeState::clear` sweep over the dcache.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EvictStats {
+    /// Expired, handle-free inodes found by the read-lock scan.
+    pub candidates: usize,
+    /// Inodes actually removed; a candidate can become ineligible between scan and removal.
+    pub evicted: usize,
+    /// Inodes removed during each write-lock hold, in order. `sum() == evicted`.
+    pub batches: Vec<usize>,
+}
 
 pub struct NodeState {
-    node_map: RwLock<NodeMap>,
+    dir_tree: DirTreeLock,
+    writers: AsyncSharedMap<u64, FuseWriter>,
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
     dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
+    path_locks: Vec<AsyncMutex<()>>,
     fh_creator: AtomicCounter,
-    meta_cache: MetaCache,
     fs: UnifiedFileSystem,
     conf: FuseConf,
+    enable_meta_cache: bool,
+    meta_cache_ttl: u64,
 }
 
 impl NodeState {
-    pub fn new(fs: UnifiedFileSystem) -> Self {
+    pub fn new(fs: UnifiedFileSystem) -> FuseResult<Self> {
         let conf = fs.conf().fuse.clone();
-        let node_map = NodeMap::new(&conf);
-        let meta_cache = MetaCache::new(conf.meta_cache_capacity, conf.meta_cache_ttl_duration);
+        let meta_cache_ttl = conf.effective_meta_cache_ttl().as_millis() as u64;
+        let enable_meta_cache = conf.effective_meta_cache_enabled();
 
-        Self {
-            node_map: RwLock::new(node_map),
+        let state = Self {
+            dir_tree: DirTreeLock::new(DirTree::new(conf.clone()), conf.metrics_enabled),
+            writers: AsyncSharedMap::default(),
             handles: RwLockHashMap::default(),
             dir_handles: RwLockHashMap::default(),
+            path_locks: (0..conf.path_lock_stripes)
+                .map(|_| AsyncMutex::new(()))
+                .collect(),
             fh_creator: AtomicCounter::new(0),
-            meta_cache,
             fs,
             conf,
-        }
+            enable_meta_cache,
+            meta_cache_ttl,
+        };
+        FuseMetrics::with(|m| {
+            m.inode_num.set(1);
+            m.inode_count.set(1);
+        });
+        Ok(state)
     }
 
-    pub fn node_write(&self) -> RwLockWriteGuard<'_, NodeMap> {
-        self.node_map.write().unwrap()
+    pub fn dir_write(&self) -> DirTreeWriteGuard<'_> {
+        self.dir_tree.write()
     }
 
-    pub fn node_read(&self) -> RwLockReadGuard<'_, NodeMap> {
-        self.node_map.read().unwrap()
-    }
-
-    pub fn meta_cache(&self) -> &MetaCache {
-        &self.meta_cache
+    pub fn dir_read(&self) -> DirTreeReadGuard<'_> {
+        self.dir_tree.read()
     }
 
     pub fn client_conf(&self) -> &ClientConf {
@@ -82,317 +129,565 @@ impl NodeState {
         self.fs.conf()
     }
 
-    pub fn current_fh(&self) -> u64 {
-        self.fh_creator.get()
+    pub fn invalid_cache(&self, ino: u64, name: Option<&str>, reason: &'static str) {
+        if !self.enable_meta_cache {
+            return;
+        }
+
+        {
+            let mut dir = self.dir_write();
+            if let Some(inode) = dir.get_inode_mut(ino, name) {
+                inode.invalid_cache();
+            }
+        }
+
+        if self.conf.metrics_enabled {
+            // A named entry always has a parent directory; an inode-only target has
+            // one unless it is the FUSE root (matches the old `path.parent()` check).
+            let has_parent = name.is_some() || ino != FUSE_ROOT_ID;
+            FuseMetrics::with(|m| m.record_invalidation(reason, has_parent));
+        }
     }
 
-    pub fn get_node(&self, id: u64) -> FuseResult<NodeAttr> {
-        self.node_read().get_check(id).cloned()
-    }
-
-    fn update_cache_state(&self, id: u64, status: &FileStatus) -> bool {
-        let mut lock = self.node_write();
-        let Some(attr) = lock.get_mut(id) else {
-            return false;
+    pub fn update_status(&self, ino: u64, name: Option<&str>, status: &FileStatus) -> bool {
+        let mut lock = self.dir_write();
+        let inode = match lock.get_inode_mut(ino, name) {
+            Some(inode) => inode,
+            None => return false,
         };
 
-        let is_changed = status.mtime != attr.mtime || status.len != attr.len;
-
-        attr.cache_valid = true;
-        attr.mtime = status.mtime;
-        attr.len = status.len;
+        let is_changed = inode.mtime != status.mtime || status.len != inode.len;
+        inode.update_status(status.clone());
 
         is_changed
     }
 
-    pub fn clear(&self) -> FuseResult<()> {
-        self.node_write().clean_cache();
-        Ok(())
-    }
-
-    pub fn should_keep_cache(&self, id: u64, status: &FileStatus) -> bool {
-        let is_changed = self.update_cache_state(id, status);
+    pub fn keep_cache(&self, ino: u64, status: &FileStatus) -> bool {
+        let is_changed = self.update_status(ino, None, status);
         !is_changed
     }
 
-    pub async fn update_writer_len(&self, attr: &mut fuse_attr) {
-        if let Some(len) = self.get_writer_len(attr.ino).await {
-            attr.size = attr.size.max(len)
-        }
+    pub fn get_parent_ino(&self, ino: u64) -> FuseResult<u64> {
+        let dir = self.dir_read();
+        let inode = dir.get_inode_check(ino, None)?;
+        Ok(inode.parent)
     }
 
-    pub async fn get_writer_len(&self, ino: u64) -> Option<u64> {
-        if let Some(writer) = self.find_writer(&ino) {
-            return Some(writer.lock().await.len() as u64);
-        }
-
-        None
+    pub fn get_path_common(&self, parent: u64, name: Option<&str>) -> FuseResult<Path> {
+        self.dir_read().get_path_common(parent, name)
     }
 
-    pub fn get_path_common<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<Path> {
-        self.node_read().get_path_common(parent, name)
+    pub fn get_path_name(&self, parent: u64, name: &str) -> FuseResult<Path> {
+        self.dir_read().get_path_name(parent, name)
     }
 
-    pub fn get_path_name<T: AsRef<str>>(&self, parent: u64, name: T) -> FuseResult<Path> {
-        self.node_read().get_path_name(parent, name)
+    pub fn get_path(&self, ino: u64) -> FuseResult<Path> {
+        self.dir_read().get_path(ino)
     }
 
-    pub fn get_path(&self, id: u64) -> FuseResult<Path> {
-        self.node_read().get_path(id)
-    }
-
-    pub fn get_path2<T: AsRef<str>>(
+    pub fn get_path2(
         &self,
-        id1: u64,
-        name1: T,
-        id2: u64,
-        name2: T,
+        ino1: u64,
+        name1: &str,
+        ino2: u64,
+        name2: &str,
     ) -> FuseResult<(Path, Path)> {
-        let map = self.node_read();
-        let path1 = map.get_path_name(id1, name1)?;
-        let path2 = map.get_path_name(id2, name2)?;
+        let dir = self.dir_read();
+        let path1 = dir.get_path_name(ino1, name1)?;
+        let path2 = dir.get_path_name(ino2, name2)?;
         Ok((path1, path2))
-    }
-
-    pub fn get_parent_id(&self, id: u64) -> FuseResult<u64> {
-        self.node_read().get_check(id).map(|x| x.parent)
     }
 
     pub fn next_fh(&self) -> u64 {
         self.fh_creator.next()
     }
 
-    pub fn find_node(&self, parent: u64, name: Option<&str>) -> FuseResult<NodeAttr> {
-        self.node_write().find_node(parent, name).map(|x| x.clone())
+    pub fn current_fh(&self) -> u64 {
+        self.fh_creator.get()
     }
 
-    // fuse.c do_lookup the equivalent implementation of the function
-    // Peer implementation of fuse.c do_lookup function.
-    // 1. Execute find_node, and if the node does not exist, create one automatically.Equivalent to an automatically built node cache
-    // 2. Update the cache if needed.
-    pub fn do_lookup<T: AsRef<str>>(
+    pub fn next_ino(&self, status: &FileStatus) -> FuseResult<u64> {
+        self.dir_read().next_id(status.id)
+    }
+
+    pub async fn lock_path(&self, path: &Path) -> tokio::sync::MutexGuard<'_, ()> {
+        let idx = (fxhash::hash32(path.full_path()) as usize) % self.path_locks.len();
+        self.path_locks[idx].lock().await
+    }
+
+    pub fn lookup_status(
         &self,
         parent: u64,
-        name: Option<T>,
+        name: &str,
         status: &FileStatus,
     ) -> FuseResult<fuse_attr> {
-        self.node_write().do_lookup(parent, name, status)
+        self.do_lookup(parent, name, status)
     }
 
-    pub fn unlink_node<T: AsRef<str>>(&self, id: u64, name: Option<T>) -> FuseResult<()> {
-        let mut map = self.node_write();
-        let node = if let Some(node) = map.lookup_node_mut(id, name) {
-            node.sub_lookup(1);
-            node.clone()
-        } else {
-            return Ok(());
+    pub fn do_lookup(&self, parent: u64, name: &str, status: &FileStatus) -> FuseResult<fuse_attr> {
+        self.do_lookup_recorded(parent, name, status, false, false)
+    }
+
+    pub fn do_lookup_recorded(
+        &self,
+        parent: u64,
+        name: &str,
+        status: &FileStatus,
+        is_real_lookup: bool,
+        metrics_enabled: bool,
+    ) -> FuseResult<fuse_attr> {
+        let record = is_real_lookup && metrics_enabled;
+
+        let caller_status = status.clone();
+        let mut dir = self.dir_write();
+        let cache_hit = record && dir.get_inode(parent, Some(name)).is_some();
+        let before = dir.inode_lens();
+        let status = dir
+            .lookup(parent, name, caller_status, true)?
+            .status
+            .clone();
+        let after = dir.inode_lens();
+        drop(dir);
+
+        let attr = FuseUtils::status_to_attr(&self.conf, &status)?;
+
+        for _ in 0..after.saturating_sub(before) {
+            FuseMetrics::with(|m| {
+                Self::inc_gauges_lockstep(&m.inode_num, &m.inode_count);
+            });
+        }
+
+        if record {
+            let result = if cache_hit {
+                CACHE_RESULT_HIT
+            } else {
+                CACHE_RESULT_MISS
+            };
+            FuseMetrics::with(|m| m.record_node_cache_lookup(result));
+        }
+        Ok(attr)
+    }
+
+    /// Max inodes removed per dcache write-lock hold during `clear`.
+    const EVICT_BATCH_SIZE: usize = 1024;
+
+    /// Evicts expired inodes. The scan holds only the read lock, and removals
+    /// take the write lock per batch so foreground metadata ops are not starved
+    /// for the whole sweep.
+    pub fn clear(&self) -> FuseResult<EvictStats> {
+        let start = LocalTime::mills();
+        let candidates = self
+            .dir_read()
+            .evict_candidates(|ino| self.has_open_handles(ino));
+
+        // One write-lock hold per batch; the per-batch counts are returned so a test
+        // can pin that bound instead of only checking that everything was removed.
+        let batches: Vec<usize> = candidates
+            .chunks(Self::EVICT_BATCH_SIZE)
+            .map(|batch| {
+                self.dir_write()
+                    .evict(batch, |ino| self.has_open_handles(ino))
+            })
+            .collect();
+
+        let stats = EvictStats {
+            candidates: candidates.len(),
+            evicted: batches.iter().sum(),
+            batches,
         };
-
-        map.delete_name(&node)
+        info!(
+            "node_state::clear: evicted {} of {} expired inodes in {} batches, remaining {}, \
+             cost {} ms",
+            stats.evicted,
+            stats.candidates,
+            stats.batches.len(),
+            self.dir_read().inode_lens(),
+            LocalTime::mills() - start
+        );
+        Ok(stats)
     }
 
-    // Peer-to-peer implementation of fuse.c forget_node
-    pub fn forget_node(&self, id: u64, n_lookup: u64) -> FuseResult<()> {
-        self.node_write().forget_node(id, n_lookup)
+    pub async fn lookup_common(&self, parent: u64, name: &str) -> FuseResult<fuse_attr> {
+        let status = self.fs_stat(parent, Some(name)).await?;
+        self.lookup_status(parent, name, &status)
     }
 
-    pub fn batch_forget_node(&self, nodes: &[&fuse_forget_one]) -> FuseResult<()> {
-        let mut state = self.node_write();
-        for node in nodes {
-            if let Err(e) = state.forget_node(node.nodeid, node.nlookup) {
-                warn!("batch_forget {:?}: {}", node, e);
+    pub async fn lookup_link(
+        &self,
+        parent: u64,
+        name: &str,
+        link_id: u64,
+    ) -> FuseResult<fuse_attr> {
+        let status = self.fs_stat(parent, Some(name)).await?;
+
+        let mut dir = self.dir_write();
+        let inode = dir.link(link_id, parent, name, status)?;
+        inode.to_attr(&self.conf)
+    }
+
+    pub fn get_ino(&self, parent: u64, name: Option<&str>) -> Option<u64> {
+        if name.is_none() {
+            Some(parent)
+        } else {
+            let dir = self.dir_read();
+            let inode = dir.get_inode(parent, name)?;
+            Some(inode.ino)
+        }
+    }
+
+    pub fn inode_exists(&self, ino: u64, name: Option<&str>) -> bool {
+        let dir = self.dir_read();
+        dir.get_inode(ino, name).is_some()
+    }
+
+    pub fn unlink(&self, ino: u64, name: &str, mark_delete: bool) -> FuseResult<bool> {
+        let before = self.dir_read().inode_lens();
+        let mut dir = self.dir_write();
+        let (last_link, _) = dir.unlink(ino, name, mark_delete)?;
+        let after = dir.inode_lens();
+        drop(dir);
+        for _ in 0..before.saturating_sub(after) {
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count);
+            });
+        }
+        Ok(last_link)
+    }
+
+    fn restore_unlink_state(&self, rollback: crate::fs::dcache::UnlinkRollback) -> FuseResult<()> {
+        self.dir_write().restore_unlink(rollback)
+    }
+
+    async fn repoint_canonical_from_master(
+        &self,
+        ino: u64,
+        removed_parent: u64,
+        removed_name: &str,
+    ) -> FuseResult<()> {
+        let (master_id, needs_repoint) = {
+            let dir = self.dir_read();
+            let Some(inode) = dir.get_inode(ino, None) else {
+                return Ok(());
+            };
+            let needs = dir.canonical_matches(ino, removed_parent, removed_name);
+            (inode.status.id, needs)
+        };
+        if !needs_repoint || master_id <= 0 {
+            return Ok(());
+        }
+
+        let dir_inos = self.dir_read().cached_dir_inos();
+        for dir_ino in dir_inos {
+            let path = match self.get_path_common(dir_ino, None) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let statuses = match self.fs.list_status(&path).await {
+                Ok(statuses) => statuses,
+                Err(_) => continue,
+            };
+            for status in statuses {
+                if status.id == master_id
+                    && !(dir_ino == removed_parent && status.name == removed_name)
+                {
+                    let name = status.name.clone();
+                    self.dir_write().repoint_canonical(ino, dir_ino, name)?;
+                    return Ok(());
+                }
             }
         }
         Ok(())
     }
 
-    // fuse.c rename_node
-    pub fn rename_node<T: AsRef<str>>(
-        &self,
-        old_id: u64,
-        old_name: T,
-        new_id: u64,
-        new_name: T,
-    ) -> FuseResult<()> {
-        self.node_write()
-            .rename_node(old_id, old_name, new_id, new_name)
+    pub fn forget(&self, ino: u64, n_lookup: u64) -> FuseResult<()> {
+        let before = self.dir_read().inode_lens();
+        self.dir_write().forget(ino, n_lookup)?;
+        let after = self.dir_read().inode_lens();
+        for _ in 0..before.saturating_sub(after) {
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count);
+            });
+        }
+        Ok(())
     }
 
-    pub fn find_link_inode(&self, curvine_ino: i64, fuse_ino: u64) -> u64 {
-        self.node_write().find_link_inode(curvine_ino, fuse_ino)
-    }
-
-    fn find_writer0(
-        map: &FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
-        ino: &u64,
-    ) -> Option<Arc<Mutex<FuseWriter>>> {
-        if let Some(h) = map.get(ino) {
-            for (_, handle) in h.iter() {
-                if let Some(writer) = &handle.writer {
-                    return Some(writer.clone());
-                }
+    pub fn batch_forget(&self, nodes: &[&fuse_forget_one]) -> FuseResult<()> {
+        let before = self.dir_read().inode_lens();
+        let mut dir = self.dir_write();
+        for node in nodes {
+            if let Err(e) = dir.forget(node.nodeid, node.nlookup) {
+                warn!("batch_forget {:?}: {}", node, e);
             }
         }
-
-        None
+        let after = dir.inode_lens();
+        drop(dir);
+        for _ in 0..before.saturating_sub(after) {
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count);
+            });
+        }
+        Ok(())
     }
 
-    pub fn find_writer(&self, ino: &u64) -> Option<Arc<Mutex<FuseWriter>>> {
-        let map = self.handles.read();
-        Self::find_writer0(&map, ino)
+    pub fn rename(
+        &self,
+        old_id: u64,
+        old_name: &str,
+        new_id: u64,
+        new_name: &str,
+    ) -> FuseResult<()> {
+        self.dir_write().rename(old_id, old_name, new_id, new_name)
     }
 
-    pub async fn new_writer(
+    pub async fn find_writer(&self, ino: u64) -> Option<Arc<FuseWriter>> {
+        self.writers.get(&ino).await
+    }
+
+    // Caller resolves ino first so writer-map key matches the handle inode.
+    pub async fn get_or_create_writer(
         &self,
         ino: u64,
         path: &Path,
         flags: OpenFlags,
         opts: CreateFileOpts,
-    ) -> FuseResult<Arc<Mutex<FuseWriter>>> {
-        let exists_writer = {
-            let lock = self.handles.read();
-            Self::find_writer0(&lock, &ino)
-        };
-
-        if let Some(writer) = exists_writer {
-            return Ok(writer);
-        }
-
-        let writer = self.fs.open_with_opts(path, opts, flags).await?;
-        let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
-        Ok(Arc::new(Mutex::new(writer)))
+    ) -> FuseResult<Arc<FuseWriter>> {
+        self.writers
+            .get_or_create(ino, async {
+                let writer = self.fs.open_with_opts(path, opts, flags).await?;
+                let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
+                Ok(Arc::new(writer))
+            })
+            .await
     }
 
-    fn get_cached_blocks(&self, path: &Path) -> Option<FileBlocks> {
-        if self.conf.enable_meta_cache {
-            self.meta_cache.get_blocks(path)
-        } else {
-            None
-        }
+    pub async fn new_writer(
+        &self,
+        path: &Path,
+        flags: OpenFlags,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FuseWriter>> {
+        let writer = self.fs.open_with_opts(path, opts, flags).await?;
+        Ok(Arc::new(FuseWriter::new(
+            &self.conf,
+            self.fs.clone_runtime(),
+            writer,
+        )))
     }
 
     pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
-        let reader = match self.get_cached_blocks(path) {
-            Some(blocks) => {
-                let reader = FsReader::new(path.clone(), self.fs.fs_context().clone(), blocks)?;
-                UnifiedReader::Cv(reader)
-            }
-
-            None => {
-                let reader = self.fs.open(path).await?;
-
-                if self.conf.enable_meta_cache {
-                    match &reader {
-                        UnifiedReader::Cv(cv_reader) => {
-                            self.meta_cache
-                                .put_open(path, cv_reader.file_blocks().clone());
-                        }
-                        UnifiedReader::Fallback(fallback_reader) => {
-                            self.meta_cache
-                                .put_open(path, fallback_reader.file_blocks().clone());
-                        }
-                        _ => {}
-                    };
-                }
-
-                reader
-            }
-        };
-
+        let reader = self.fs.open(path).await?;
         let reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), reader);
         Ok(reader)
     }
 
-    pub async fn complete_writer(&self, ino: u64) -> FuseResult<()> {
-        if let Some(existing_writer) = self.find_writer(&ino) {
-            existing_writer.lock().await.complete(None).await?;
+    pub async fn flush_writer(&self, ino: u64) -> FuseResult<()> {
+        if let Some(existing_writer) = self.find_writer(ino).await {
+            existing_writer.flush(None).await?;
         }
         Ok(())
     }
 
     pub async fn new_handle(
         &self,
-        ino: u64,
+        ino: Option<u64>,
         path: &Path,
-        flags: u32,
+        flags: OpenFlags,
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
-        let flags = OpenFlags::new(flags);
+        let mode = flags.access_mode();
 
-        let (reader, writer) = match flags.access_mode() {
-            mode if mode == OpenFlags::RDONLY => {
-                let reader = self.new_reader(path).await?;
-                (Some(RawPtr::from_owned(reader)), None)
+        // Read-only: only a reader, no writer to register in the writers map.
+        if mode == OpenFlags::RDONLY {
+            let reader = self.new_reader(path).await?;
+            let mut status = reader.status().clone();
+            let ino = match ino {
+                Some(ino) => ino,
+                None => self.next_ino(&status)?,
+            };
+            status.id = ino as i64;
+            let handle = self
+                .insert_handle_with_writer(ino, Some(Arc::new(reader)), None, status)
+                .await;
+            return Ok(handle);
+        }
+
+        if mode != OpenFlags::WRONLY && mode != OpenFlags::RDWR {
+            return err_fuse!(libc::EINVAL, "Invalid access mode: {:?}", mode);
+        }
+
+        // Resolve inode once so the writer-map key always equals the handle ino.
+        let (ino, writer) = match ino {
+            Some(ino) => {
+                let writer = self.get_or_create_writer(ino, path, flags, opts).await?;
+                (ino, writer)
             }
-
-            mode if mode == OpenFlags::WRONLY => {
-                let writer = self.new_writer(ino, path, flags, opts).await?;
-                (None, Some(writer))
+            None => {
+                let writer = self.new_writer(path, flags, opts).await?;
+                let ino = self.next_ino(writer.status())?;
+                let writer = self.writers.insert::<FuseError>(ino, writer).await?;
+                (ino, writer)
             }
+        };
 
-            mode if mode == OpenFlags::RDWR => {
-                let writer = self.new_writer(ino, path, flags, opts).await?;
-                let (is_ufs, ufs_path) = {
-                    let lock = writer.lock().await;
-                    (lock.is_ufs(), lock.path().full_path().to_string())
-                };
-                let reader = if is_ufs {
-                    warn!(
-                        "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
-                        path,
-                        ufs_path
-                    );
-                    None
-                } else {
-                    let reader = self.new_reader(path).await?;
-                    Some(RawPtr::from_owned(reader))
-                };
-
-                (reader, Some(writer))
-            }
-            _ => {
-                return err_fuse!(
-                    libc::EINVAL,
-                    "Invalid access mode: {:?}",
-                    flags.access_mode()
+        let reader = if mode == OpenFlags::RDWR {
+            if writer.is_ufs() {
+                warn!(
+                    "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
+                    path,
+                    writer.path().full_path()
                 );
-            }
-        };
-
-        let status = if let Some(writer) = &writer {
-            let lock = writer.lock().await;
-            lock.status().clone()
-        } else if let Some(reader) = &reader {
-            reader.status().clone()
-        } else {
-            return err_fuse!(libc::EINVAL, "Invalid flags: {:?}", flags);
-        };
-
-        let mut lock = self.handles.write();
-
-        // Check if writer already exists to prevent duplicate creation
-        let check_writer = if let Some(writer) = writer {
-            if let Some(exist_writer) = Self::find_writer0(&lock, &ino) {
-                Some(exist_writer)
+                None
             } else {
-                Some(writer)
+                match self.new_reader(path).await {
+                    Ok(reader) => Some(Arc::new(reader)),
+                    Err(e) => {
+                        // No handle is created, so no RELEASE will drop the writer
+                        // reference taken above; release it here or the writer is
+                        // never completed and stays in the map.
+                        self.release_writer_ref(ino, &writer).await;
+                        return Err(e);
+                    }
+                }
             }
         } else {
             None
         };
 
-        let handle = Arc::new(FileHandle::new(
+        let mut status = writer.status().clone();
+        status.id = ino as i64;
+
+        let handle = self
+            .insert_handle_with_writer(ino, reader, Some(writer), status)
+            .await;
+
+        Ok(handle)
+    }
+
+    /// Drop one writer reference taken by an open that failed before a handle
+    /// existed, with the same flush/complete cleanup RELEASE would run.
+    async fn release_writer_ref(&self, ino: u64, writer: &Arc<FuseWriter>) {
+        let writer = writer.clone();
+        let (_, res) = self
+            .writers
+            .release_with_cleanup(ino, move |last| async move {
+                if last {
+                    writer.complete(None).await
+                } else {
+                    writer.flush(None).await
+                }
+            })
+            .await;
+        if let Err(e) = res {
+            warn!("cleanup writer for ino {} after failed open: {}", ino, e);
+        }
+    }
+
+    /// Test-only: register a shared writer without going through `new_handle`
+    /// (used by release-cleanup tests that inject a failing writer).
+    #[cfg(test)]
+    pub(crate) async fn insert_shared_writer_for_test(&self, ino: u64, writer: Arc<FuseWriter>) {
+        self.writers.insert::<FuseError>(ino, writer).await.unwrap();
+    }
+
+    /// Test-visible handle insertion; production callers go through `new_handle`.
+    pub(crate) async fn insert_handle_with_writer(
+        &self,
+        ino: u64,
+        reader: Option<Arc<FuseReader>>,
+        writer: Option<Arc<FuseWriter>>,
+        status: FileStatus,
+    ) -> Arc<FileHandle> {
+        let handle = Arc::new(FileHandle::new_backend(
             ino,
             self.next_fh(),
             reader,
-            check_writer,
+            writer,
             status,
         ));
-        lock.entry(handle.ino)
-            .or_default()
-            .insert(handle.fh, handle.clone());
 
-        Ok(handle)
+        let mut lock = self.handles.write();
+        Self::insert_file_handle_locked(&mut lock, handle.ino(), handle.fh(), handle.clone());
+        handle
+    }
+
+    fn insert_file_handle_locked(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
+        ino: u64,
+        fh: u64,
+        handle: Arc<FileHandle>,
+    ) {
+        if Self::map_insert_handle(lock, ino, fh, handle) {
+            FuseMetrics::with(|m| {
+                Self::inc_gauges_lockstep(&m.file_handle_num, &m.file_handle_count)
+            });
+        }
+    }
+
+    fn remove_file_handle_locked(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
+        ino: u64,
+        fh: u64,
+    ) -> Option<Arc<FileHandle>> {
+        let (handle, removed) = Self::map_remove_handle(lock, ino, fh);
+        if removed {
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.file_handle_num, &m.file_handle_count)
+            });
+        }
+        handle
+    }
+
+    fn map_insert_handle<H>(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<H>>>,
+        ino: u64,
+        fh: u64,
+        handle: Arc<H>,
+    ) -> bool {
+        lock.entry(ino).or_default().insert(fh, handle).is_none()
+    }
+
+    fn map_remove_handle<H>(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<H>>>,
+        ino: u64,
+        fh: u64,
+    ) -> (Option<Arc<H>>, bool) {
+        if let Some(map) = lock.get_mut(&ino) {
+            let handle = map.remove(&fh);
+            let removed = handle.is_some();
+            if map.is_empty() {
+                lock.remove(&ino);
+            }
+            (handle, removed)
+        } else {
+            (None, false)
+        }
+    }
+
+    fn insert_dir_handle_locked(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
+        ino: u64,
+        fh: u64,
+        handle: Arc<DirHandle>,
+    ) {
+        if Self::map_insert_handle(lock, ino, fh, handle) {
+            FuseMetrics::with(|m| {
+                Self::inc_gauges_lockstep(&m.dir_handle_num, &m.dir_handle_count)
+            });
+        }
+    }
+
+    fn remove_dir_handle_locked(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
+        ino: u64,
+        fh: u64,
+    ) -> Option<Arc<DirHandle>> {
+        let (handle, removed) = Self::map_remove_handle(lock, ino, fh);
+        if removed {
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.dir_handle_num, &m.dir_handle_count)
+            });
+        }
+        handle
     }
 
     pub fn find_handle(&self, ino: u64, fh: u64) -> FuseResult<Arc<FileHandle>> {
@@ -412,63 +707,260 @@ impl NodeState {
 
     pub fn remove_handle(&self, ino: u64, fh: u64) -> Option<Arc<FileHandle>> {
         let mut lock = self.handles.write();
-        if let Some(map) = lock.get_mut(&ino) {
-            let handle = map.remove(&fh);
+        Self::remove_file_handle_locked(&mut lock, ino, fh)
+    }
 
-            if map.is_empty() {
-                lock.remove(&ino);
+    pub async fn release_handle(
+        &self,
+        ino: u64,
+        fh: u64,
+    ) -> FuseResult<(Arc<FileHandle>, FuseResult<()>)> {
+        // Find the handle without removing it yet.
+        let handle = self.find_handle(ino, fh)?;
+
+        let close_result: FuseResult<()> = match handle.as_ref() {
+            FileHandle::Backend(_) if handle.has_writer() => {
+                let cleanup_handle = handle.clone();
+                let (_, cleanup_result) = self
+                    .writers
+                    .release_with_cleanup(handle.ino(), move |last| async move {
+                        if last {
+                            cleanup_handle.complete(None).await
+                        } else {
+                            cleanup_handle.flush(None).await
+                        }
+                    })
+                    .await;
+                cleanup_result
             }
 
-            handle
-        } else {
-            None
-        }
+            _ => Ok(()),
+        };
+
+        // RELEASE is not retried; remove the handle regardless of close result.
+        let _ = self.remove_handle(ino, fh);
+
+        Ok((handle, close_result))
     }
 
     pub fn has_open_handles(&self, ino: u64) -> bool {
-        let lock = self.handles.read();
-        if let Some(map) = lock.get(&ino) {
-            !map.is_empty()
-        } else {
-            false
+        // Both OPEN and OPENDIR handles keep the inode addressable until their
+        // corresponding RELEASE/RELEASEDIR request.
+        {
+            let lock = self.handles.read();
+            if lock.get(&ino).is_some_and(|map| !map.is_empty()) {
+                return true;
+            }
+        }
+
+        let lock = self.dir_handles.read();
+        lock.get(&ino).is_some_and(|map| !map.is_empty())
+    }
+
+    pub fn clear_mark_delete(&self, ino: u64) -> FuseResult<()> {
+        self.dir_write().clear_mark_delete(ino)
+    }
+
+    /// Record the unlink-time Curvine path and master file id for a pending
+    /// deferred delete. See `DirTree::set_deferred_delete_path`.
+    pub fn set_deferred_delete_path(&self, ino: u64, path: &Path) {
+        self.dir_write()
+            .set_deferred_delete_path(ino, path.full_path().to_owned());
+    }
+
+    /// The recorded unlink-time path of a pending deferred delete, if any.
+    pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
+        self.dir_read().deferred_delete_path(ino)
+    }
+
+    /// The recorded master file id of a pending deferred delete, if any.
+    pub fn deferred_delete_master_id(&self, ino: u64) -> Option<i64> {
+        self.dir_read().deferred_delete_master_id(ino)
+    }
+
+    /// Clear inode `mark_delete` and the `deleted_children` entry for a specific
+    /// hardlink name under `parent` (not the inode's primary parent/name).
+    pub fn clear_unlink_state(&self, ino: u64, parent: u64, name: &str) -> FuseResult<()> {
+        let mut dir = self.dir_write();
+        if let Some(inode) = dir.get_inode_mut(ino, None) {
+            inode.mark_delete = false;
+        }
+        if let Ok(parent_dir) = dir.get_dir_mut_check(parent) {
+            parent_dir.clear_deleted_child(name);
+        }
+        Ok(())
+    }
+
+    pub fn complete_deferred_delete(
+        &self,
+        ino: u64,
+        delete_result: Result<DeleteResult, FsError>,
+    ) -> FuseResult<()> {
+        // Keep the mark observable after failure; reclaiming it without another
+        // FUSE request would need a background retry, which is not yet implemented.
+        match delete_result {
+            Ok(_) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
+            Err(e) => Err(e.into()),
         }
     }
 
-    pub fn should_delete_now<T: AsRef<str>>(
-        &self,
-        parent: u64,
-        name: Option<T>,
-    ) -> FuseResult<bool> {
-        let name = name.as_ref();
+    /// Deletes `path` on the master, honouring `fuse.async_delete`.
+    ///
+    /// Both lanes have the same namespace effect, so callers keep treating `Ok`
+    /// as "the name is gone". The async lane only moves the physical
+    /// reclamation into the master's background purger and reports no counts.
+    pub async fn delete_path(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        if self.fs.conf().fuse.async_delete {
+            self.fs.delete_async(path, recursive).await
+        } else {
+            self.fs.delete(path, recursive).await
+        }
+    }
 
-        let id = {
-            let map = self.node_read();
-            match map.lookup_node(parent, name) {
-                Some(v) => v.id,
-                None => return err_fuse!(libc::ENOENT, "node {} not found", parent),
-            }
+    pub async fn fs_unlink(&self, parent: u64, name: &str) -> FuseResult<()> {
+        let path = {
+            let dir = self.dir_read();
+            dir.get_path_name(parent, name)?
+        };
+        let _guard = self.lock_path(&path).await;
+
+        let ino = {
+            let dir = self.dir_read();
+            dir.get_inode(parent, Some(name)).map(|inode| inode.ino)
         };
 
-        if self.has_open_handles(id) {
-            let mut map = self.node_write();
-            map.mark_pending_delete(id);
-            let path = map.get_path(id)?;
-            info!(
-                "unlink {}: file has open handles (ino={}), marking for delayed deletion",
-                path, id
-            );
-            Ok(false)
-        } else {
-            Ok(true)
+        // Kernel may still hold a dentry after our dcache dropped the name
+        // (hardlink + FORGET races). Best-effort delete on master; treat
+        // already-gone as success so recursive cleanup (LTP tst_rmdir) is
+        // not failed by ENOENT on a stale name.
+        let Some(ino) = ino else {
+            return match self.delete_path(&path, false).await {
+                Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        };
+
+        // Always mark for deletion and remove the directory entry first, and check
+        // has_open_handles inside the same dir_write critical section.
+        let (has_handles, last_link, rollback) = {
+            let mut dir = self.dir_write();
+            let (last_link, rollback) = dir.unlink(parent, name, true)?;
+            (self.has_open_handles(ino), last_link, rollback)
+        };
+
+        // Removing one of several hard links must reach the master immediately:
+        // the master owns the authoritative nlink count and removes only this
+        // directory entry. Open handles do not require deferral while another
+        // link still keeps the inode alive.
+        if !last_link {
+            if !rollback.repointed && self.dir_read().canonical_matches(ino, parent, name) {
+                self.repoint_canonical_from_master(ino, parent, name)
+                    .await?;
+            }
+            match self.delete_path(&path, false).await {
+                Ok(_) | Err(FsError::FileNotFound(_)) => (),
+                Err(e) => {
+                    self.restore_unlink_state(rollback)?;
+                    return Err(e.into());
+                }
+            }
+            self.clear_unlink_state(ino, parent, name)?;
+            return Ok(());
         }
+
+        if has_handles {
+            debug!("unlink ino={}, path={}: open handles, deferring", ino, path);
+            self.set_deferred_delete_path(ino, &path);
+            return Ok(());
+        }
+
+        // Defer if a concurrent fs_open registered a handle while we waited.
+        if self.has_open_handles(ino) {
+            debug!(
+                "unlink ino={}, path={}: handle appeared, deferring",
+                ino, path
+            );
+            self.set_deferred_delete_path(ino, &path);
+            return Ok(());
+        }
+
+        match self.delete_path(&path, false).await {
+            Ok(_) => (),
+            Err(FsError::FileNotFound(_)) => (),
+            Err(e) => {
+                self.restore_unlink_state(rollback)?;
+                return Err(e.into());
+            }
+        }
+
+        // Clear mark_delete + this name's deleted_child entry now that the
+        // server-side delete has completed (use unlink parent/name, not the
+        // inode primary path — hardlinks share one inode across names).
+        self.clear_unlink_state(ino, parent, name)?;
+
+        Ok(())
     }
 
-    pub fn remove_pending_delete(&self, ino: u64) -> bool {
-        self.node_write().remove_pending_delete(ino)
+    pub async fn fs_rmdir(&self, parent: u64, name: &str) -> FuseResult<()> {
+        let path = {
+            let dir = self.dir_read();
+            dir.get_path_name(parent, name)?
+        };
+        let _guard = self.lock_path(&path).await;
+
+        let ino = {
+            let dir = self.dir_read();
+            dir.get_inode(parent, Some(name)).map(|inode| inode.ino)
+        };
+
+        let Some(ino) = ino else {
+            return match self.delete_path(&path, false).await {
+                Ok(_) | Err(FsError::FileNotFound(_)) => {
+                    self.invalid_cache(parent, None, INVAL_REASON_RMDIR);
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            };
+        };
+
+        let rollback = {
+            let mut dir = self.dir_write();
+            let (_last_link, rollback) = dir.unlink(parent, name, true)?;
+            rollback
+        };
+
+        match self.delete_path(&path, false).await {
+            Ok(_) | Err(FsError::FileNotFound(_)) => (),
+            Err(e) => {
+                if let Err(err) = self.restore_unlink_state(rollback) {
+                    warn!("fs_rmdir ino={} rollback failed: {}", ino, err);
+                }
+                return Err(e.into());
+            }
+        }
+
+        self.clear_unlink_state(ino, parent, name)?;
+        let removed = {
+            let mut dir = self.dir_write();
+            !self.has_open_handles(ino) && dir.reclaim_unreferenced(ino, parent, name)
+        };
+        if removed {
+            FuseMetrics::with(|m| Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count));
+        }
+        self.invalid_cache(parent, None, INVAL_REASON_RMDIR);
+
+        Ok(())
     }
 
-    pub fn is_pending_delete(&self, ino: u64) -> bool {
-        self.node_read().is_pending_delete(ino)
+    pub async fn deferred_delete_ready(&self, ino: u64) -> FuseResult<bool> {
+        // Early exit if there are open handles or no pending delete.
+        if self.has_open_handles(ino) || !self.dir_read().pending_delete(ino) {
+            return Ok(false);
+        }
+
+        // NOTE: Do NOT clear mark_delete here. The mark stays set until after
+        // self.fs.delete() completes in release().
+        Ok(true)
     }
 
     pub fn find_dir_handle(&self, ino: u64, fh: u64) -> FuseResult<Arc<DirHandle>> {
@@ -489,17 +981,7 @@ impl NodeState {
 
     pub fn remove_dir_handle(&self, ino: u64, fh: u64) -> Option<Arc<DirHandle>> {
         let mut lock = self.dir_handles.write();
-        if let Some(map) = lock.get_mut(&ino) {
-            let handle = map.remove(&fh);
-
-            if map.is_empty() {
-                lock.remove(&ino);
-            }
-
-            handle
-        } else {
-            None
-        }
+        Self::remove_dir_handle_locked(&mut lock, ino, fh)
     }
 
     pub async fn new_dir_handle(&self, ino: u64, path: &Path) -> FuseResult<Arc<DirHandle>> {
@@ -512,11 +994,15 @@ impl NodeState {
             stream,
         ));
         let mut lock = self.dir_handles.write();
-        lock.entry(ino)
-            .or_default()
-            .insert(handle.fh, handle.clone());
+        Self::insert_dir_handle_locked(&mut lock, ino, handle.fh, handle.clone());
 
         Ok(handle)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_dir_handle(&self, handle: Arc<DirHandle>) {
+        let mut lock = self.dir_handles.write();
+        Self::insert_dir_handle_locked(&mut lock, handle.ino, handle.fh, handle);
     }
 
     pub fn all_handles(&self) -> Vec<Arc<FileHandle>> {
@@ -543,45 +1029,561 @@ impl NodeState {
         lock.values().map(|m| m.len()).sum()
     }
 
-    pub fn set_metrics(&self, m: &FuseMetrics) {
-        m.inode_num.set(self.node_read().nodes_len() as i64);
-        m.file_handle_num.set(self.file_handles_len() as i64);
-        m.dir_handle_num.set(self.dir_handles_len() as i64);
+    fn sync_legacy_gauges(&self) {
+        FuseMetrics::with(|m| {
+            let inode_len = self.dir_read().inode_lens() as i64;
+            let file_len = self.file_handles_len() as i64;
+            let dir_len = self.dir_handles_len() as i64;
+            m.inode_num.set(inode_len);
+            m.inode_count.set(inode_len);
+            m.file_handle_num.set(file_len);
+            m.file_handle_count.set(file_len);
+            m.dir_handle_num.set(dir_len);
+            m.dir_handle_count.set(dir_len);
+        });
+    }
+
+    fn inc_gauges_lockstep(legacy: &curvine_metrics::Gauge, alias: &curvine_metrics::Gauge) {
+        legacy.inc();
+        alias.inc();
+    }
+
+    fn dec_gauges_lockstep(legacy: &curvine_metrics::Gauge, alias: &curvine_metrics::Gauge) {
+        legacy.dec();
+        alias.dec();
+    }
+
+    pub fn writers_len(&self) -> usize {
+        self.writers.len()
+    }
+
+    pub fn writer_keys(&self) -> Vec<u64> {
+        self.writers.keys()
+    }
+
+    fn record_status_cache(&self, status: &'static str) {
+        if self.conf.metrics_enabled {
+            FuseMetrics::with(|m| m.record_user_meta_cache(CACHE_STATUS, status));
+        }
+    }
+
+    /// Count backend status materialized into dcache when attr cache is active.
+    pub fn record_status_put(&self) {
+        if self.enable_meta_cache {
+            self.record_status_cache(CACHE_RESULT_PUT);
+        }
+    }
+
+    fn get_cached_status(
+        &self,
+        ino: u64,
+        name: Option<&str>,
+        add_lookup: bool,
+    ) -> FuseResult<Option<FileStatus>> {
+        if !self.enable_meta_cache {
+            self.dir_read().check_deleted_child(ino, name)?;
+            return Ok(None);
+        }
+
+        let status = {
+            let dir = self.dir_read();
+            dir.check_deleted_child(ino, name)?;
+
+            let inode = if add_lookup {
+                if self.conf.entry_ttl.is_zero() {
+                    None
+                } else {
+                    dir.lookup_valid_inode(ino, name, self.meta_cache_ttl)
+                }
+            } else {
+                dir.get_valid_inode(ino, name, self.meta_cache_ttl)
+            };
+            inode.map(|inode| inode.status.clone())
+        };
+
+        // Hit/miss recorded the moment the cache read resolves (before any backend
+        // fetch), so a backend error/ENOENT after a miss stays in the denominator.
+        self.record_status_cache(if status.is_some() {
+            CACHE_RESULT_HIT
+        } else {
+            CACHE_RESULT_MISS
+        });
+
+        Ok(status)
+    }
+
+    fn resolve_dot<'a>(&self, ino: u64, name: &'a str) -> FuseResult<DotTarget<'a>> {
+        let dir = self.dir_read();
+        let inode = dir.get_inode_check(ino, None)?;
+        let parent_inode = if name == FUSE_PARENT_DIR && !inode.is_root() {
+            Some(dir.get_inode_check(inode.parent, None)?)
+        } else {
+            None
+        };
+        let to_root = inode.is_root() || parent_inode.is_some_and(|p| p.is_root());
+
+        if to_root {
+            Ok(DotTarget {
+                ino: FUSE_ROOT_ID,
+                name: Cow::Borrowed(name),
+                root_status: Some(dir.get_inode_check(FUSE_ROOT_ID, None)?.status.clone()),
+            })
+        } else if let Some(parent_inode) = parent_inode {
+            Ok(DotTarget {
+                ino: parent_inode.parent,
+                name: Cow::Owned(parent_inode.name.to_owned()),
+                root_status: None,
+            })
+        } else {
+            Ok(DotTarget {
+                ino: inode.parent,
+                name: Cow::Owned(inode.name.to_owned()),
+                root_status: None,
+            })
+        }
+    }
+
+    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
+        let (ino, cow_name, root_status) = if name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR {
+            let dot = self.resolve_dot(ino, name)?;
+            (dot.ino, dot.name, dot.root_status)
+        } else {
+            (ino, Cow::Borrowed(name), None)
+        };
+
+        if let Some(status) = root_status {
+            if self.conf.metrics_enabled {
+                FuseMetrics::with(|m| m.record_node_cache_lookup(CACHE_RESULT_HIT));
+            }
+            let mut attr = FuseUtils::status_to_attr(&self.conf, &status)?;
+            attr.ino = FUSE_ROOT_ID;
+            return Ok(attr);
+        }
+
+        let name = cow_name.as_ref();
+
+        if let Some(status) = self.get_cached_status(ino, Some(name), true)? {
+            if self.conf.metrics_enabled {
+                FuseMetrics::with(|m| m.record_node_cache_lookup(CACHE_RESULT_HIT));
+            }
+            return FuseUtils::status_to_attr(&self.conf, &status);
+        }
+
+        let path = {
+            let dir = self.dir_read();
+
+            if self.enable_meta_cache && dir.dir_scan_valid(ino, self.meta_cache_ttl) {
+                return err_fuse!(libc::ENOENT, "inode {} {} not found", ino, name);
+            }
+
+            dir.get_path_name(ino, name)?
+        };
+
+        let status = self.fs.get_status(&path).await?;
+        // Real FUSE Lookup path: record `node_cache_total{operation=lookup}` via the
+        // existing `do_lookup_recorded` hit/miss machinery (is_real_lookup=true).
+        let attr = self.do_lookup_recorded(ino, name, &status, true, self.conf.metrics_enabled)?;
+        if self.enable_meta_cache {
+            self.record_status_cache(CACHE_RESULT_PUT);
+        }
+        Ok(attr)
+    }
+
+    pub async fn update_writer_len(&self, attr: &mut fuse_attr) {
+        let Some(writer) = self.find_writer(attr.ino).await else {
+            return;
+        };
+
+        attr.size = attr.size.max(writer.len() as u64);
+
+        (attr.mtime, attr.mtimensec) = FuseUtils::millis_to_fuse_timestamp(writer.mtime());
+        if FuseUtils::fuse_timestamp_is_later(
+            (attr.mtime, attr.mtimensec),
+            (attr.ctime, attr.ctimensec),
+        ) {
+            attr.ctime = attr.mtime;
+            attr.ctimensec = attr.mtimensec;
+        }
+    }
+
+    pub async fn get_writer_len(&self, ino: u64) -> Option<u64> {
+        if let Some(writer) = self.find_writer(ino).await {
+            return Some(writer.len() as u64);
+        }
+
+        None
+    }
+
+    pub async fn get_writer_mtime(&self, ino: u64) -> Option<i64> {
+        if let Some(writer) = self.find_writer(ino).await {
+            return Some(writer.mtime());
+        }
+
+        None
+    }
+
+    fn unlinked_status(&self, ino: u64) -> Option<FileStatus> {
+        let dir = self.dir_read();
+        dir.get_inode(ino, None)
+            .filter(|inode| inode.is_unlinked())
+            .map(|inode| inode.clone_status())
+    }
+
+    /// Resolve unlinked status, cached status, or the backend path under one read guard.
+    fn probe_status(&self, ino: u64, name: Option<&str>) -> FuseResult<StatProbe> {
+        let (cached, snapshot) = {
+            let dir = self.dir_read();
+            // An unlinked inode can remain addressable by nodeid until the kernel
+            // releases its lookup/open references. Its former path no longer exists.
+            if name.is_none() {
+                if let Some(inode) = dir.get_inode(ino, None).filter(|i| i.is_unlinked()) {
+                    return Ok(StatProbe::Hit(inode.clone_status()));
+                }
+            }
+
+            dir.check_deleted_child(ino, name)?;
+            let cached = if self.enable_meta_cache {
+                dir.get_valid_inode(ino, name, self.meta_cache_ttl)
+                    .map(|inode| inode.status.clone())
+            } else {
+                None
+            };
+            let child = dir.get_ino(ino, name);
+            let nlink = dir.get_inode(ino, name).map(|inode| inode.nlink);
+            (
+                cached.ok_or_else(|| dir.get_path_common(ino, name)),
+                ProbeSnapshot { child, nlink },
+            )
+        };
+
+        if self.enable_meta_cache {
+            self.record_status_cache(if cached.is_ok() {
+                CACHE_RESULT_HIT
+            } else {
+                CACHE_RESULT_MISS
+            });
+        }
+        match cached {
+            Ok(status) => Ok(StatProbe::Hit(status)),
+            Err(path) => Ok(StatProbe::Miss {
+                path: path?,
+                snapshot,
+            }),
+        }
+    }
+
+    pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
+        let (path, snapshot) = match self.probe_status(ino, name)? {
+            StatProbe::Hit(status) => return Ok(status),
+            StatProbe::Miss { path, snapshot } => (path, snapshot),
+        };
+        let status = self.fs.get_status(&path).await?;
+
+        self.cache_resolved_status(ino, name, &status, snapshot);
+
+        Ok(status)
+    }
+
+    /// Backend `get_status` for an explicit path, without touching the dcache.
+    /// Used by the release-time deferred-delete identity check, which must not
+    /// repopulate cache state for a path that may have been reused (#1395).
+    pub async fn fs_stat_by_path(&self, path: &Path) -> FuseResult<FileStatus> {
+        Ok(self.fs.get_status(path).await?)
+    }
+
+    pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
+        let (path, snapshot) = match self.probe_status(ino, None)? {
+            StatProbe::Hit(status) => return Ok(status),
+            StatProbe::Miss { path, snapshot } => (path, snapshot),
+        };
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+        let status = match self.fs.get_status(&path).await {
+            Ok(status) => status,
+            Err(e) => {
+                if let Some(status) = self.unlinked_status(ino) {
+                    return Ok(status);
+                }
+                return Err(e.into());
+            }
+        };
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+        // No-op for non-root inodes; the root refresh is required because
+        // fs_lookup serves `.`/`..` to the root inode without a cache gate.
+        self.cache_resolved_status(ino, None, &status, snapshot);
+        Ok(status)
+    }
+
+    fn cache_resolved_status(
+        &self,
+        ino: u64,
+        name: Option<&str>,
+        status: &FileStatus,
+        snapshot: ProbeSnapshot,
+    ) {
+        // The root inode starts as synthetic metadata with mode 0. Cache its first
+        // real backend status even when the general metadata cache is disabled so
+        // every path traversal does not issue another root get_status RPC.
+        let cache_root = ino == FUSE_ROOT_ID && name.is_none();
+        if !(self.enable_meta_cache || cache_root) {
+            return;
+        }
+
+        {
+            let mut dir = self.dir_write();
+            if dir.get_ino(ino, name) != snapshot.child {
+                return;
+            }
+            let Some(inode) = dir.get_inode_mut(ino, name) else {
+                return;
+            };
+            if inode.mark_delete
+                || inode.is_unlinked()
+                || snapshot.nlink.is_some_and(|nlink| nlink != inode.nlink)
+            {
+                return;
+            }
+            inode.update_status(status.clone());
+        }
+
+        if self.enable_meta_cache {
+            self.record_status_cache(CACHE_RESULT_PUT);
+        }
+    }
+
+    pub async fn fs_mkdir(&self, ino: u64, name: &str, opts: MkdirOpts) -> FuseResult<fuse_attr> {
+        let path = self.get_path_name(ino, name)?;
+        let status = match self.fs.mkdir_with_opts(&path, opts).await? {
+            Some(status) => status,
+            None => self.fs.get_status(&path).await?,
+        };
+
+        self.lookup_status(ino, name, &status)
+    }
+
+    pub async fn fs_create(
+        &self,
+        ino: u64,
+        name: &str,
+        flags: u32,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FileHandle>> {
+        let flags = OpenFlags::new(flags);
+        let path = self.get_path_name(ino, name)?;
+        let _guard = self.lock_path(&path).await;
+
+        let handle = if flags.read_only() {
+            // The file is completed right away, so a pre-allocated first
+            // block would only be journaled, reserved and released again.
+            let writer = self
+                .fs
+                .open_without_first_block(&path, opts.clone(), flags.set_write_only())
+                .await?;
+            let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
+            let mut status = writer.status().clone();
+            writer.complete(None).await?;
+
+            let child_ino = self.next_ino(&status)?;
+            status.id = child_ino as i64;
+            let _ = self.lookup_status(ino, name, &status)?;
+            return self.new_handle(Some(child_ino), &path, flags, opts).await;
+        } else {
+            self.new_handle(None, &path, flags, opts).await?
+        };
+        self.lookup_status(ino, name, &handle.status())?;
+        Ok(handle)
+    }
+
+    pub async fn fs_open(
+        &self,
+        ino: u64,
+        flags: u32,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FileHandle>> {
+        let flags = OpenFlags::new(flags);
+        let path = self.get_path(ino)?;
+        self.new_handle(Some(ino), &path, flags, opts).await
+    }
+
+    pub async fn new_meta_handle(
+        &self,
+        ino: u64,
+        mut status: FileStatus,
+    ) -> FuseResult<Arc<FileHandle>> {
+        status.id = ino as i64;
+        Ok(self
+            .insert_handle_with_writer(ino, None, None, status)
+            .await)
+    }
+
+    pub async fn fs_set_attr(&self, ino: u64, opts: SetAttrOpts) -> FuseResult<FileStatus> {
+        let mtime = opts.mtime;
+        let path = self.get_path_common(ino, None)?;
+        let status = if let Some(mtime) = mtime {
+            let fs = self.fs.clone();
+            let writer_path = path.clone();
+            let writer_opts = opts.clone();
+            match self
+                .writers
+                .with_resource_result(&ino, |writer| async move {
+                    // Serialize with RELEASE cleanup. Otherwise complete can
+                    // overwrite an mtime that a following utimensat just set.
+                    let status = match fs.fuse_set_attr(&writer_path, writer_opts).await? {
+                        Some(status) => status,
+                        None => fs.get_status(&writer_path).await?,
+                    };
+                    let receiver = writer.enqueue_mtime(mtime).await?;
+                    Ok::<_, FuseError>((status, writer, receiver))
+                })
+                .await?
+            {
+                Some((status, writer, receiver)) => {
+                    // Queue ordering is established while the writer entry is
+                    // locked; wait for older backend IO after releasing it.
+                    writer.wait_mtime(receiver).await?;
+                    status
+                }
+                None => match self.fs.fuse_set_attr(&path, opts).await? {
+                    Some(status) => status,
+                    None => self.fs.get_status(&path).await?,
+                },
+            }
+        } else {
+            match self.fs.fuse_set_attr(&path, opts).await? {
+                Some(status) => status,
+                None => self.fs.get_status(&path).await?,
+            }
+        };
+        let _ = self.update_status(ino, None, &status);
+
+        Ok(status)
+    }
+
+    pub async fn fs_resize(
+        &self,
+        ino: u64,
+        fh: u64,
+        opts: FileAllocOpts,
+    ) -> FuseResult<FileStatus> {
+        opts.validate()?;
+
+        let path = self.get_path(ino)?;
+        // Keep fallocate/truncate ordered with the inode's active writer when
+        // one exists, regardless of which file handle the syscall supplied.
+        if let Some(writer) = self.find_writer(ino).await {
+            return Ok(writer.resize(opts).await?);
+        }
+
+        if fh != 0 {
+            let handle = self.find_handle(ino, fh)?;
+            return handle.resize(opts).await;
+        }
+
+        self.fs.resize(&path, opts).await?;
+        // The filesystem resize API does not expose its returned FileBlocks, so
+        // fetch the authoritative timestamps when no active writer is available.
+        Ok(self.fs.get_status(&path).await?)
+    }
+
+    pub async fn fs_rename(
+        &self,
+        old_id: u64,
+        old_name: &str,
+        new_id: u64,
+        new_name: &str,
+        flags: RenameFlags,
+    ) -> FuseResult<()> {
+        let (old_path, new_path) = self.get_path2(old_id, old_name, new_id, new_name)?;
+        self.fs
+            .rename_with_flags(&old_path, &new_path, flags)
+            .await?;
+        if flags.exchange_mode() {
+            self.dir_write()
+                .exchange(old_id, old_name, new_id, new_name)
+        } else {
+            self.rename(old_id, old_name, new_id, new_name)
+        }
+    }
+
+    pub async fn fs_fsync(&self, parent: u64, name: Option<&str>) -> FuseResult<()> {
+        let Some(ino) = self.dir_read().get_ino(parent, name) else {
+            return Ok(());
+        };
+
+        self.flush_writer(ino).await?;
+
+        Ok(())
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        let metrics_enabled = self.conf.metrics_enabled;
+        if metrics_enabled {
+            let node_len = self.dir_read().inode_lens();
+            let file_len = self.file_handles_len();
+            let dir_len = self.dir_handles_len();
+            FuseMetrics::with(|m| {
+                m.set_state_handle_count(STATE_KIND_NODE_MAP, node_len);
+                m.set_state_handle_count(STATE_KIND_FILE_HANDLES, file_len);
+                m.set_state_handle_count(STATE_KIND_DIR_HANDLES, dir_len);
+            });
+        }
+
         writer.write_all(STATE_FILE_MAGIC)?;
         writer.write_len(STATE_FILE_VERSION)?;
 
         {
-            info!("node_state::persist: saving node_map");
-            let node_lock = self.node_read();
-            node_lock.persist(writer)?;
-            info!("node_state::persist: {} node saved", node_lock.nodes_len());
-        }
-
-        info!("node_state::persist: saving file_handles");
-        let handles = self.all_handles();
-        writer.write_len(handles.len() as u64)?;
-        for handle in &handles {
-            if let Err(e) = handle.persist(writer).await {
-                error!("node_state::persist: error saving file_handle {:?}", e)
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_NODE_MAP);
+            info!("node_state::persist: saving dir_tree");
+            let dir = self.dir_read();
+            dir.persist(writer)?;
+            info!("node_state::persist: {} node saved", dir.inode_lens());
+            if let Some(stage) = stage {
+                stage.success();
             }
         }
-        info!("node_state::persist: {} file_handles saved", handles.len());
 
-        info!("node_state::persist: saving dir_handles");
-        let dir_handles = self.all_dir_handles();
-        writer.write_len(dir_handles.len() as u64)?;
-        for dir_handle in &dir_handles {
-            writer.write_struct(&**dir_handle)?;
+        {
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_FILE_HANDLES);
+            info!("node_state::persist: saving file_handles");
+            let handles = self.all_handles();
+            writer.write_len(handles.len() as u64)?;
+            for handle in &handles {
+                if let Err(e) = handle.persist(writer).await {
+                    error!(
+                        "node_state::persist: error saving file_handle ino={}, fh={}: {:?}",
+                        handle.ino(),
+                        handle.fh(),
+                        e
+                    );
+                    return Err(e);
+                }
+            }
+            info!("node_state::persist: {} file_handles saved", handles.len());
+            if let Some(stage) = stage {
+                stage.success();
+            }
         }
-        info!(
-            "node_state::persist: {} dir_handles saved",
-            dir_handles.len()
-        );
 
-        writer.write_len(self.fh_creator.get())?;
+        {
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_DIR_HANDLES);
+            info!("node_state::persist: saving dir_handles");
+            let dir_handles = self.all_dir_handles();
+            writer.write_len(dir_handles.len() as u64)?;
+            for dir_handle in &dir_handles {
+                writer.write_struct(&**dir_handle)?;
+            }
+            info!(
+                "node_state::persist: {} dir_handles saved",
+                dir_handles.len()
+            );
+            writer.write_len(self.fh_creator.get())?;
+            if let Some(stage) = stage {
+                stage.success();
+            }
+        }
 
         Ok(())
     }
@@ -593,14 +1595,20 @@ impl NodeState {
             .await?;
 
         let dots = stream::iter([
-            Ok(CurvineFileSystem::new_dot_status(FUSE_CURRENT_DIR)),
-            Ok(CurvineFileSystem::new_dot_status(FUSE_PARENT_DIR)),
+            Ok(FuseUtils::new_dot_status(FUSE_CURRENT_DIR)),
+            Ok(FuseUtils::new_dot_status(FUSE_PARENT_DIR)),
         ]);
 
         Ok(ListStream::new(dots.chain(inner)))
     }
 
+    fn restored_dir_handle_path(&self, handle: &DirHandle) -> FuseResult<Path> {
+        self.get_path(handle.ino)
+    }
+
     pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
+        let metrics_enabled = self.conf.metrics_enabled;
+
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != STATE_FILE_MAGIC {
@@ -621,142 +1629,1357 @@ impl NodeState {
         }
 
         {
-            info!("node_state::restore: restoring node_map");
-            let mut node_lock = self.node_write();
-            node_lock.restore(reader)?;
+            let stage = StateStageTimer::start(metrics_enabled, false, STATE_STAGE_NODE_MAP);
+            info!("node_state::restore: restoring dir_tree");
+            let mut dir = self.dir_write();
+            dir.restore(reader)?;
             info!(
-                "node_state::restore: node_map {}restored",
-                node_lock.nodes_len()
+                "node_state::restore: dir_tree {} restored",
+                dir.inode_lens()
             );
+            if let Some(stage) = stage {
+                stage.success();
+            }
         }
 
-        info!("node_state::restore: restoring file_handles");
-        let handles_count = reader.read_len()?;
-        let mut restored_handles = 0;
-        for i in 0..handles_count {
-            let handle = match FileHandle::restore(reader, self).await {
-                Ok(handle) => handle,
-                Err(e) => {
-                    error!(
-                        "failed to restore file_handle {}/{}: {}",
-                        i + 1,
-                        handles_count,
-                        e
-                    );
-                    continue;
+        let result: FuseResult<()> = async {
+            {
+                let stage =
+                    StateStageTimer::start(metrics_enabled, false, STATE_STAGE_FILE_HANDLES);
+                info!("node_state::restore: restoring file_handles");
+                let handles_count = reader.read_len()?;
+                for i in 0..handles_count {
+                    let handle = match FileHandle::restore(reader, self).await {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            error!(
+                                "failed to restore file_handle {}/{}: {}",
+                                i + 1,
+                                handles_count,
+                                e
+                            );
+                            return Err(e);
+                        }
+                    };
+
+                    self.handles
+                        .write()
+                        .entry(handle.ino())
+                        .or_default()
+                        .insert(handle.fh(), Arc::new(handle));
                 }
-            };
+                info!(
+                    "node_state::restore: {} file_handles restored",
+                    handles_count
+                );
+                if let Some(stage) = stage {
+                    stage.success();
+                }
+            }
 
-            self.handles
-                .write()
-                .entry(handle.ino)
-                .or_default()
-                .insert(handle.fh, Arc::new(handle));
-            restored_handles += 1;
+            {
+                let stage = StateStageTimer::start(metrics_enabled, false, STATE_STAGE_DIR_HANDLES);
+                info!("node_state::restore: restoring dir_handles");
+                let dir_handles_count = reader.read_len()?;
+                for _ in 0..dir_handles_count {
+                    let mut handle = reader.read_struct::<DirHandle>()?;
+                    // DirHandle.path may be the original open-time path. The
+                    // restored dcache is authoritative after a rename.
+                    let path = self.restored_dir_handle_path(&handle)?;
+                    let stream = self.list_stream(&path).await?;
+                    handle.set_stream(&path, stream);
+
+                    self.dir_handles
+                        .write()
+                        .entry(handle.ino)
+                        .or_default()
+                        .insert(handle.fh, Arc::new(handle));
+                }
+                info!(
+                    "node_state::restore: {} dir_handles restored",
+                    dir_handles_count
+                );
+
+                let fh_creator_value = reader.read_len()?;
+                self.fh_creator.set(fh_creator_value);
+                if let Some(stage) = stage {
+                    stage.success();
+                }
+            }
+            Ok(())
         }
-        info!(
-            "node_state::restore: {}/{} file_handles restored",
-            restored_handles, handles_count
-        );
+        .await;
 
-        info!("node_state::restore: restoring dir_handles");
-        let dir_handles_count = reader.read_len()?;
-        for _ in 0..dir_handles_count {
-            let mut handle = reader.read_struct::<DirHandle>()?;
-            let path = Path::from_str(&handle.path)?;
-            let stream = self.list_stream(&path).await?;
-            handle.set_stream(stream);
-
-            self.dir_handles
-                .write()
-                .entry(handle.ino)
-                .or_default()
-                .insert(handle.fh, Arc::new(handle));
+        self.sync_legacy_gauges();
+        if result.is_ok() {
+            info!("node_state::restore: state restore completed successfully");
         }
-        info!(
-            "node_state::restore: {} dir_handles restored",
-            dir_handles_count
-        );
-
-        let fh_creator_value = reader.read_len()?;
-        self.fh_creator.set(fh_creator_value);
-
-        info!("node_state::restore: state restore completed successfully");
-        Ok(())
+        result
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::fs::state::NodeState;
+    use crate::fs::state::file_handle::FileHandle;
+    use crate::fs::state::node_state::ProbeSnapshot;
+    use crate::fs::state::{DirHandle, NodeState};
+    #[cfg(target_os = "linux")]
+    use crate::fs::FuseWriter;
+    #[cfg(target_os = "linux")]
+    use crate::FuseError;
     use crate::FUSE_ROOT_ID;
+
+    #[cfg(target_os = "linux")]
+    use bytes::Bytes;
     use curvine_client::unified::UnifiedFileSystem;
-    use curvine_common::conf::{ClusterConf, FuseConf};
-    use curvine_common::state::FileStatus;
-    use orpc::runtime::AsyncRuntime;
-    use orpc::CommonResult;
+    #[cfg(target_os = "linux")]
+    use curvine_client::unified::UnifiedWriter;
+    use curvine_config::ClusterConf;
+    use curvine_error::FsError;
+    #[cfg(target_os = "linux")]
+    use curvine_fs_api::local::LocalWriter;
+    #[cfg(target_os = "linux")]
+    use curvine_fs_api::Writer;
+    use curvine_fs_api::{ListStream, Path};
+    use curvine_fs_api::{StateReader, StateWriter};
+    use curvine_model::FileStatus;
+    use curvine_net::net::InetAddr;
+    use curvine_runtime::common::{DurationUnit, FastHashMap, Utils};
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
 
-    #[test]
-    pub fn path() -> CommonResult<()> {
-        let mut conf = ClusterConf::default();
-        conf.fuse.init()?;
-        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
-        let state = NodeState::new(fs);
+    fn file_handle(ino: u64, fh: u64) -> Arc<FileHandle> {
+        Arc::new(FileHandle::new_backend(
+            ino,
+            fh,
+            None,
+            None,
+            FileStatus::with_name(ino as i64, "f".to_string(), false),
+        ))
+    }
 
-        let a = state.find_node(FUSE_ROOT_ID, Some("a"))?;
-        println!("a = {:?}", a);
-        let b = state.find_node(a.id, Some("b"))?;
-        println!("b = {:?}", b);
-
-        let path = state.get_path(a.id)?;
-        println!("path = {}", path);
-        assert_eq!(path.path(), "/a");
-
-        let path = state.get_path(b.id)?;
-        println!("path = {}", path);
-        assert_eq!(path.path(), "/a/b");
-
-        let path = state.get_path_common(a.id, Some("b"))?;
-        println!("path = {}", path);
-        assert_eq!(path.path(), "/a/b");
-        Ok(())
+    fn dir_handle(ino: u64, fh: u64) -> Arc<DirHandle> {
+        let path = Path::from_str("/d").unwrap();
+        Arc::new(DirHandle::new(
+            ino,
+            fh,
+            &path,
+            16,
+            ListStream::new(futures::stream::empty()),
+        ))
     }
 
     #[test]
-    pub fn ttl() -> CommonResult<()> {
-        let mut conf = ClusterConf {
-            fuse: FuseConf {
-                node_cache_size: 2,
-                node_cache_timeout: "100ms".to_string(),
+    fn file_handle_chokepoint_per_fh_invariants() {
+        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> = FastHashMap::default();
+
+        assert!(NodeState::map_insert_handle(
+            &mut map,
+            1,
+            10,
+            file_handle(1, 10)
+        ));
+        assert!(NodeState::map_insert_handle(
+            &mut map,
+            1,
+            11,
+            file_handle(1, 11)
+        ));
+        assert_eq!(map.get(&1).map(|m| m.len()), Some(2));
+
+        assert!(!NodeState::map_insert_handle(
+            &mut map,
+            1,
+            10,
+            file_handle(1, 10)
+        ));
+        assert_eq!(map.get(&1).map(|m| m.len()), Some(2));
+
+        let (removed, did_remove) = NodeState::map_remove_handle(&mut map, 1, 10);
+        assert!(removed.is_some() && did_remove);
+        assert_eq!(map.get(&1).map(|m| m.len()), Some(1));
+
+        let (_, did_remove) = NodeState::map_remove_handle(&mut map, 1, 11);
+        assert!(did_remove);
+        assert!(map.get(&1).is_none());
+
+        let (removed, did_remove) = NodeState::map_remove_handle(&mut map, 1, 99);
+        assert!(removed.is_none() && !did_remove);
+    }
+
+    #[test]
+    fn dir_handle_chokepoint_per_fh_invariants() {
+        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> = FastHashMap::default();
+
+        assert!(NodeState::map_insert_handle(
+            &mut map,
+            2,
+            20,
+            dir_handle(2, 20)
+        ));
+        assert!(NodeState::map_insert_handle(
+            &mut map,
+            2,
+            21,
+            dir_handle(2, 21)
+        ));
+        assert_eq!(map.get(&2).map(|m| m.len()), Some(2));
+
+        assert!(NodeState::map_remove_handle(&mut map, 2, 20).1);
+        assert!(NodeState::map_remove_handle(&mut map, 2, 21).1);
+        assert!(map.get(&2).is_none());
+        assert!(!NodeState::map_remove_handle(&mut map, 2, 99).1);
+    }
+
+    #[test]
+    fn clear_keeps_expired_inode_until_directory_handle_is_released() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.node_cache_ttl = std::time::Duration::from_secs(60);
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let ino = {
+            let mut tree = state.dir_write();
+            let ino = tree
+                .lookup(
+                    FUSE_ROOT_ID,
+                    "d",
+                    FileStatus::with_name(2, "d".to_string(), true),
+                    true,
+                )
+                .unwrap()
+                .ino;
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+
+        {
+            let mut handles = state.dir_handles.write();
+            NodeState::insert_dir_handle_locked(&mut handles, ino, 20, dir_handle(ino, 20));
+        }
+
+        state.clear().unwrap();
+        assert!(
+            state.dir_read().get_inode(ino, None::<&str>).is_some(),
+            "an open directory handle must keep an expired inode addressable"
+        );
+
+        state.remove_dir_handle(ino, 20).unwrap();
+        state.clear().unwrap();
+        assert!(
+            state.dir_read().get_inode(ino, None::<&str>).is_none(),
+            "the expired inode should be evicted after its directory handle is released"
+        );
+    }
+
+    #[test]
+    fn clear_evicts_across_multiple_batches() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let total = 2 * NodeState::EVICT_BATCH_SIZE + 3;
+        {
+            let mut tree = state.dir_write();
+            for i in 0..total {
+                let name = format!("f{i}");
+                let status = FileStatus::with_name(0, name.clone(), false);
+                let ino = tree.lookup(FUSE_ROOT_ID, &name, status, true).unwrap().ino;
+                tree.forget(ino, 1).unwrap();
+                tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            }
+        }
+        let before = state.dir_read().inode_lens();
+
+        let stats = state.clear().unwrap();
+
+        // The bound this refactor promises is 1024 removals per write-lock hold. Keep it literal
+        // instead of deriving it from `EVICT_BATCH_SIZE`: weakening the constant (e.g. to
+        // `usize::MAX`, or collapsing the loop into one `dir_write().evict(&candidates, ..)`)
+        // would otherwise relax the expectation along with the implementation.
+        const MAX_REMOVALS_PER_HOLD: usize = 1024;
+        assert_eq!(stats.candidates, total);
+        assert_eq!(stats.evicted, total);
+        assert_eq!(
+            stats.batches.len(),
+            total.div_ceil(MAX_REMOVALS_PER_HOLD),
+            "one write-lock hold per batch: {:?}",
+            stats.batches
+        );
+        assert!(
+            stats.batches.iter().all(|&n| n <= MAX_REMOVALS_PER_HOLD),
+            "a write-lock hold may not cover more than {MAX_REMOVALS_PER_HOLD} removals: {:?}",
+            stats.batches
+        );
+
+        let dir = state.dir_read();
+        assert_eq!(dir.inode_lens(), before - total);
+        assert!(dir.get_dir_check(FUSE_ROOT_ID).unwrap().children.is_empty());
+    }
+
+    #[test]
+    fn resolved_root_status_is_cached_when_metadata_cache_is_disabled() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(false);
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        assert!(!state.enable_meta_cache);
+        assert_eq!(
+            state
+                .dir_read()
+                .get_inode(FUSE_ROOT_ID, None)
+                .unwrap()
+                .lifecycle,
+            crate::fs::dcache::Lifecycle::Invalid
+        );
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            None,
+            &FileStatus {
+                is_dir: true,
+                mode: 0o755,
                 ..Default::default()
             },
-            ..Default::default()
+            ProbeSnapshot {
+                child: Some(FUSE_ROOT_ID),
+                nlink: None,
+            },
+        );
+
+        let dir = state.dir_read();
+        let root = dir.get_inode(FUSE_ROOT_ID, None).unwrap();
+        assert_eq!(root.lifecycle, crate::fs::dcache::Lifecycle::Cached);
+        assert_eq!(root.mode, 0o755);
+    }
+
+    #[test]
+    fn lookup_hit_follows_entry_timeout() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.attr_timeout = DurationUnit::new(5 * DurationUnit::SECONDS);
+        conf.fuse.entry_timeout = DurationUnit::new(0);
+        conf.fuse.init().unwrap();
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let status = FileStatus::with_name(11, "name_ttl".to_string(), false);
+        {
+            let mut tree = state.dir_write();
+            tree.lookup(FUSE_ROOT_ID, "name_ttl", status, true).unwrap();
+        }
+
+        assert!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, Some("name_ttl"), true)
+                .unwrap()
+                .is_none(),
+            "entry_timeout = 0 must not serve names from the userspace cache"
+        );
+        assert!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, Some("name_ttl"), false)
+                .unwrap()
+                .is_some(),
+            "the attr copy stays cached for getattr"
+        );
+    }
+
+    #[test]
+    fn cached_lookup_counts_concurrent_hits_under_read_lock() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let ino = state
+            .dir_write()
+            .lookup(
+                FUSE_ROOT_ID,
+                "f",
+                FileStatus::with_name(9, "f".to_string(), false),
+                true,
+            )
+            .unwrap()
+            .ino;
+
+        let (threads, per_thread) = (8, 100);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    for _ in 0..per_thread {
+                        let hit = state.get_cached_status(FUSE_ROOT_ID, Some("f"), true);
+                        assert!(hit.unwrap().is_some());
+                    }
+                });
+            }
+        });
+
+        let n_lookup = state
+            .dir_read()
+            .get_inode_check(ino, None)
+            .unwrap()
+            .n_lookup();
+        assert_eq!(n_lookup, 1 + threads * per_thread);
+    }
+
+    #[test]
+    fn invalidating_parent_status_drops_stale_nlink() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            None,
+            &FileStatus {
+                is_dir: true,
+                nlink: 3,
+                mode: 0o755,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(FUSE_ROOT_ID),
+                nlink: None,
+            },
+        );
+        assert_eq!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, None, false)
+                .unwrap()
+                .unwrap()
+                .nlink,
+            3
+        );
+
+        state.invalid_cache(FUSE_ROOT_ID, None, crate::fuse_metrics::INVAL_REASON_RMDIR);
+        assert!(state
+            .get_cached_status(FUSE_ROOT_ID, None, false)
+            .unwrap()
+            .is_none());
+    }
+
+    /// An unlink that commits while the backend read is in flight must resolve
+    /// to the dcache tombstone, never to a backend error: the unlinked inode is
+    /// answered from the dcache alone.
+    #[test]
+    fn guarded_fs_stat_observes_concurrent_directory_unlink() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = Some(true);
+            conf.fuse.metrics_enabled = false;
+            // Hermetic backend: an unlinked inode must never need it, so any
+            // get_status here fails fast against a closed port.
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(42, "gone".to_string(), true);
+                status.mode = 0o755;
+                status.nlink = 2;
+                let ino = dir.lookup(FUSE_ROOT_ID, "gone", status, true).unwrap().ino;
+                dir.get_inode_mut_check(ino, None).unwrap().invalid_cache();
+                ino
+            };
+
+            let task_state = state.clone();
+            let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
+            tokio::task::yield_now().await;
+
+            state
+                .dir_write()
+                .unlink(FUSE_ROOT_ID, "gone", false)
+                .unwrap();
+
+            let status = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task)
+                .await
+                .expect("an unlinked inode must be answered without waiting on the backend")
+                .expect("fs_stat_guarded panicked")
+                .expect("an unlinked inode must fall back to the dcache status");
+            assert!(status.is_dir);
+            assert_eq!(status.mode, 0o755);
+            assert_eq!(status.nlink, 1);
+            assert_eq!(
+                state
+                    .dir_read()
+                    .get_inode_check(ino, None)
+                    .unwrap()
+                    .n_lookup(),
+                1
+            );
+        });
+    }
+
+    /// A backend status read before an unlink committed must not overwrite the
+    /// dcache's deletion bookkeeping when the resolution is cached afterwards.
+    #[test]
+    fn resolved_status_is_not_cached_for_unlinked_inode() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let ino = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(44, "gone".to_string(), true);
+            status.mode = 0o755;
+            status.nlink = 2;
+            dir.lookup(FUSE_ROOT_ID, "gone", status, true).unwrap().ino
         };
-        conf.fuse.init()?;
+        state
+            .dir_write()
+            .unlink(FUSE_ROOT_ID, "gone", false)
+            .unwrap();
+        state.invalid_cache(ino, None, crate::fuse_metrics::INVAL_REASON_RMDIR);
 
-        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
-        let state = NodeState::new(fs);
-        let status_a = FileStatus::with_name(2, "a".to_string(), true);
-        let status_b = FileStatus::with_name(3, "b".to_string(), true);
-        let status_c = FileStatus::with_name(4, "c".to_string(), true);
-        let a = state.do_lookup(FUSE_ROOT_ID, Some("a"), &status_a)?;
-        let b = state.do_lookup(a.ino, Some("b"), &status_b)?;
-        let c = state.do_lookup(b.ino, Some("c"), &status_c)?;
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                is_dir: true,
+                nlink: 2,
+                mode: 0o755,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(2),
+            },
+        );
 
-        state.forget_node(c.ino, 1)?;
-        state.forget_node(b.ino, 1)?;
-        thread::sleep(Duration::from_secs(1));
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(inode.nlink, 1, "pre-unlink nlink must not be restored");
+        assert_eq!(
+            inode.lifecycle,
+            crate::fs::dcache::Lifecycle::Invalid,
+            "a backend write-back must not revert the invalidation"
+        );
+    }
 
-        // Trigger cache cleaning
-        let a1 = state.find_node(FUSE_ROOT_ID, Some("a"));
-        assert!(a1.is_ok());
+    /// A link count that moved while the backend read was in flight is the same
+    /// deletion bookkeeping as an unlink, even when the dcache entry is still
+    /// referenced and therefore not flagged as unlinked yet.
+    #[test]
+    fn changed_nlink_rejects_stale_write_back() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
 
-        let c1 = state.get_path_common(c.ino, Some("1.log"));
-        assert!(c1.is_err());
+        let ino = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(46, "shared".to_string(), false);
+            status.mode = 0o644;
+            status.nlink = 2;
+            let ino = dir
+                .lookup(FUSE_ROOT_ID, "shared", status, true)
+                .unwrap()
+                .ino;
+            // One link was dropped while the kernel still holds a reference, so
+            // neither `mark_delete` nor `is_unlinked` is set.
+            dir.get_inode_mut_check(ino, None).unwrap().sub_link(1);
+            ino
+        };
 
-        Ok(())
+        // A status that agrees with the current bookkeeping but was read before
+        // an unlink still loses to the probe snapshot.
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                nlink: 1,
+                mode: 0o600,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(2),
+            },
+        );
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(
+            inode.nlink, 1,
+            "a link count that moved after the probe is stale"
+        );
+        assert_eq!(inode.mode, 0o644, "the whole status must be rejected");
+        drop(dir);
+
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                nlink: 2,
+                mode: 0o600,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(1),
+            },
+        );
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(inode.nlink, 2, "the backend count is authoritative");
+        assert_eq!(inode.mode, 0o600, "the refreshed status must be cached");
+    }
+
+    #[test]
+    fn stale_write_back_skips_recreated_name() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let probed = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(52, "swap".to_string(), false);
+            status.mode = 0o644;
+            status.nlink = 1;
+            dir.lookup(FUSE_ROOT_ID, "swap", status, true).unwrap().ino
+        };
+        let snapshot = ProbeSnapshot {
+            child: Some(probed),
+            nlink: Some(1),
+        };
+
+        let replacement = {
+            let mut dir = state.dir_write();
+            dir.unlink(FUSE_ROOT_ID, "swap", true).unwrap();
+            let mut status = FileStatus::with_name(53, "swap".to_string(), true);
+            status.mode = 0o755;
+            status.nlink = 1;
+            dir.lookup(FUSE_ROOT_ID, "swap", status, true).unwrap().ino
+        };
+        assert_ne!(probed, replacement);
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            Some("swap"),
+            &FileStatus {
+                nlink: 1,
+                mode: 0o600,
+                ..Default::default()
+            },
+            snapshot,
+        );
+
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(replacement, None).unwrap();
+        assert_eq!(inode.mode, 0o755, "the replacement keeps its own mode");
+        assert!(
+            inode.is_dir,
+            "a file status must not convert the replacement"
+        );
+        assert!(
+            inode.dir.is_some(),
+            "the replacement directory must keep its children map"
+        );
+    }
+
+    /// `rm_dir` drops the dcache entry before the master delete, so a failed
+    /// delete must put the dentry back instead of leaving a phantom removal.
+    #[test]
+    fn failed_rmdir_restores_dcache_entry() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.metrics_enabled = false;
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(48, "victim".to_string(), true);
+                status.mode = 0o755;
+                status.nlink = 1;
+                dir.lookup(FUSE_ROOT_ID, "victim", status, true)
+                    .unwrap()
+                    .ino
+            };
+
+            assert!(
+                state.fs_rmdir(FUSE_ROOT_ID, "victim").await.is_err(),
+                "a dead backend must fail the rmdir"
+            );
+
+            let dir = state.dir_read();
+            let inode = dir.get_inode_check(ino, None).unwrap();
+            assert!(!inode.mark_delete, "the delete mark must be rolled back");
+            assert_eq!(inode.nlink, 1, "the link count must be rolled back");
+            assert_eq!(
+                dir.get_inode(FUSE_ROOT_ID, Some("victim")).map(|i| i.ino),
+                Some(ino),
+                "the dentry must be restored"
+            );
+            assert!(
+                dir.check_deleted_child(FUSE_ROOT_ID, Some("victim"))
+                    .is_ok(),
+                "the deleted-child marker must be cleared"
+            );
+        });
+    }
+
+    #[test]
+    fn stat_without_meta_cache_does_not_wait_on_path_lock() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = Some(false);
+            conf.fuse.metrics_enabled = false;
+            // Hermetic backend: point at a closed port and keep every retry
+            // budget short, so the RPC fails deterministically well inside
+            // the timeout below. The defaults retry a refused connect for
+            // ~60s, which would trip the timeout even when the lock is
+            // correctly skipped.
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(43, "stat-no-cache".to_string(), false);
+                status.mode = 0o644;
+                dir.lookup(FUSE_ROOT_ID, "stat-no-cache", status, true)
+                    .unwrap()
+                    .ino
+            };
+
+            // Hold the path lock across the would-be RPC. With the metadata
+            // cache disabled stat must not queue behind it: the kernel
+            // revalidates the mount root on every traversal, so holding this
+            // lock across the RPC serializes every stat in the mount.
+            let path = state.get_path(ino).unwrap();
+            let guard = state.lock_path(&path).await;
+
+            let task_state = state.clone();
+            let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
+            let finished = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task).await;
+            drop(guard);
+
+            let joined = finished
+                .expect("fs_stat_guarded must not wait on the path lock when the meta cache is disabled")
+                .expect("fs_stat_guarded panicked");
+            assert!(
+                joined.is_err(),
+                "expected the closed-port backend error from the unlocked RPC"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_chokepoints_inc_dec_their_own_gauge_only() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let mx = crate::FuseMetrics::get();
+
+        let mut file_map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> =
+            FastHashMap::default();
+        let file_before = mx.file_handle_num.get();
+        let dir_before = mx.dir_handle_num.get();
+
+        NodeState::insert_file_handle_locked(&mut file_map, 7, 70, file_handle(7, 70));
+        assert_eq!(mx.file_handle_num.get(), file_before + 1);
+        assert_eq!(mx.dir_handle_num.get(), dir_before);
+
+        NodeState::remove_file_handle_locked(&mut file_map, 7, 70);
+        assert_eq!(mx.file_handle_num.get(), file_before);
+
+        let mut dir_map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> =
+            FastHashMap::default();
+        let dir_before = mx.dir_handle_num.get();
+        let file_before = mx.file_handle_num.get();
+
+        NodeState::insert_dir_handle_locked(&mut dir_map, 8, 80, dir_handle(8, 80));
+        assert_eq!(mx.dir_handle_num.get(), dir_before + 1);
+        assert_eq!(mx.file_handle_num.get(), file_before);
+
+        NodeState::remove_dir_handle_locked(&mut dir_map, 8, 80);
+        assert_eq!(mx.dir_handle_num.get(), dir_before);
+    }
+
+    #[test]
+    fn inc_dec_gauges_lockstep_move_both_together() {
+        let legacy = curvine_metrics::Metrics::new_gauge(
+            "test_lockstep_legacy_gauge_unique",
+            "isolated legacy gauge",
+        )
+        .unwrap();
+        let alias = curvine_metrics::Metrics::new_gauge(
+            "test_lockstep_alias_gauge_unique",
+            "isolated alias gauge",
+        )
+        .unwrap();
+
+        NodeState::inc_gauges_lockstep(&legacy, &alias);
+        NodeState::inc_gauges_lockstep(&legacy, &alias);
+        assert_eq!(legacy.get(), 2);
+        assert_eq!(alias.get(), 2);
+
+        NodeState::dec_gauges_lockstep(&legacy, &alias);
+        assert_eq!(legacy.get(), 1);
+        assert_eq!(alias.get(), 1);
+    }
+
+    #[test]
+    fn restore_returns_error_on_corrupt_file_handle_record() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt).unwrap();
+            let persisted_state = NodeState::new(fs.clone()).unwrap();
+            let restored_state = NodeState::new(fs).unwrap();
+
+            let state_path = Utils::temp_file();
+            let _ = std::fs::remove_file(&state_path);
+            let mut writer = StateWriter::new(&state_path).unwrap();
+            writer.write_all(crate::STATE_FILE_MAGIC).unwrap();
+            writer.write_len(crate::STATE_FILE_VERSION).unwrap();
+            persisted_state.dir_read().persist(&mut writer).unwrap();
+
+            writer.write_len(1).unwrap();
+            writer.write_struct(&FileHandle::TYPE_BACKEND).unwrap();
+            writer.write_all(b"not-json\n").unwrap();
+
+            // A restore loop that swallows the corrupt handle reads these as
+            // dir_handles_count and fh_creator, then incorrectly returns Ok.
+            writer.write_len(0).unwrap();
+            writer.write_len(0).unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+
+            let mut reader = StateReader::new(&state_path).unwrap();
+            let result = restored_state.restore(&mut reader).await;
+            drop(reader);
+            let _ = std::fs::remove_file(&state_path);
+
+            assert!(
+                result.is_err(),
+                "a corrupt file-handle record must fail the whole state restore"
+            );
+        });
+    }
+
+    #[test]
+    fn persisted_dir_handle_resolves_path_after_ancestor_rename() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt).unwrap();
+            let persisted_state = NodeState::new(fs.clone()).unwrap();
+            let restored_state = NodeState::new(fs).unwrap();
+
+            let dir_ino = {
+                let mut tree = persisted_state.dir_write();
+                let parent_ino = tree
+                    .lookup(
+                        FUSE_ROOT_ID,
+                        "old",
+                        FileStatus::with_name(10, "old".to_string(), true),
+                        false,
+                    )
+                    .unwrap()
+                    .ino;
+                tree.lookup(
+                    parent_ino,
+                    "d",
+                    FileStatus::with_name(11, "d".to_string(), true),
+                    false,
+                )
+                .unwrap()
+                .ino
+            };
+
+            let old_path = persisted_state.get_path(dir_ino).unwrap();
+            let handle = Arc::new(DirHandle::new(
+                dir_ino,
+                77,
+                &old_path,
+                16,
+                ListStream::new(futures::stream::empty()),
+            ));
+            persisted_state
+                .dir_handles
+                .write()
+                .entry(dir_ino)
+                .or_default()
+                .insert(handle.fh, handle);
+
+            persisted_state
+                .rename(FUSE_ROOT_ID, "old", FUSE_ROOT_ID, "new")
+                .unwrap();
+            assert_eq!(
+                persisted_state.get_path(dir_ino).unwrap().full_path(),
+                "/new/d"
+            );
+
+            let state_path = Utils::temp_file();
+            let _ = std::fs::remove_file(&state_path);
+            let mut writer = StateWriter::new(&state_path).unwrap();
+            persisted_state.persist(&mut writer).await.unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+
+            let mut reader = StateReader::new(&state_path).unwrap();
+            let mut magic = [0u8; 4];
+            reader.read_exact(&mut magic).unwrap();
+            assert_eq!(&magic, crate::STATE_FILE_MAGIC);
+            assert_eq!(reader.read_len().unwrap(), crate::STATE_FILE_VERSION);
+            restored_state.dir_write().restore(&mut reader).unwrap();
+
+            assert_eq!(reader.read_len().unwrap(), 0, "no file handles persisted");
+            assert_eq!(reader.read_len().unwrap(), 1, "one dir handle persisted");
+            let persisted_handle = reader.read_struct::<DirHandle>().unwrap();
+            assert_eq!(persisted_handle.path, "/old/d");
+
+            let restored_path = restored_state
+                .restored_dir_handle_path(&persisted_handle)
+                .unwrap();
+            assert_eq!(restored_path.full_path(), "/new/d");
+            drop(reader);
+            let _ = std::fs::remove_file(&state_path);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persist_returns_error_when_file_handle_persist_fails() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            // /dev/full makes persist's complete() return the queued write failure.
+            let full_path = Path::from_str("/dev/full").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let status = local_writer.status().clone();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+            state
+                .insert_handle_with_writer(1, None, Some(fuse_writer), status)
+                .await;
+
+            let state_path = Utils::temp_file();
+            let _ = std::fs::remove_file(&state_path);
+            let mut writer = StateWriter::new(&state_path).unwrap();
+            let result = state.persist(&mut writer).await;
+            drop(writer);
+            let _ = std::fs::remove_file(&state_path);
+
+            assert!(
+                result.is_err(),
+                "a file-handle persist failure must fail the whole state persist"
+            );
+        });
+    }
+
+    #[test]
+    fn deferred_delete_error_retains_mark_until_success_or_not_found() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let ino = {
+            let mut dir = state.dir_write();
+            let status = FileStatus::with_name(123, "pending".to_string(), false);
+            let ino = dir
+                .lookup(FUSE_ROOT_ID, "pending", status, true)
+                .unwrap()
+                .ino;
+            dir.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
+            ino
+        };
+
+        assert!(state.dir_read().pending_delete(ino));
+        assert!(state
+            .complete_deferred_delete(ino, Err(FsError::common("delete failed")))
+            .is_err());
+        assert!(state.dir_read().pending_delete(ino));
+
+        state
+            .complete_deferred_delete(ino, Err(FsError::file_not_found("/pending")))
+            .unwrap();
+        assert!(!state.dir_read().pending_delete(ino));
+    }
+
+    #[test]
+    fn fs_lookup_root_dot_and_dotdot_returns_root_attr() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let dot = state
+                .fs_lookup(FUSE_ROOT_ID, crate::FUSE_CURRENT_DIR)
+                .await
+                .unwrap();
+            let dotdot = state
+                .fs_lookup(FUSE_ROOT_ID, crate::FUSE_PARENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(dot.ino, FUSE_ROOT_ID);
+            assert_eq!(dotdot.ino, FUSE_ROOT_ID);
+        });
+    }
+
+    #[test]
+    fn fs_lookup_child_of_root_dotdot_returns_root_attr() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let child_ino = {
+                let mut dir = state.dir_write();
+                dir.lookup(
+                    FUSE_ROOT_ID,
+                    "child",
+                    FileStatus::with_name(42, "child".to_string(), false),
+                    true,
+                )
+                .unwrap()
+                .ino
+            };
+
+            let parent = state
+                .fs_lookup(child_ino, crate::FUSE_PARENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(parent.ino, FUSE_ROOT_ID);
+        });
+    }
+
+    #[test]
+    fn fs_lookup_non_root_dot_and_grandchild_dotdot_resolve_to_expected_inodes() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = Some(true);
+            conf.fuse.metrics_enabled = false;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let (a_ino, b_ino) = {
+                let mut dir = state.dir_write();
+                let a_ino = dir
+                    .lookup(
+                        FUSE_ROOT_ID,
+                        "a",
+                        FileStatus::with_name(41, "a".to_string(), true),
+                        true,
+                    )
+                    .unwrap()
+                    .ino;
+                let b_ino = dir
+                    .lookup(
+                        a_ino,
+                        "b",
+                        FileStatus::with_name(42, "b".to_string(), true),
+                        true,
+                    )
+                    .unwrap()
+                    .ino;
+                (a_ino, b_ino)
+            };
+
+            let dot = state
+                .fs_lookup(b_ino, crate::FUSE_CURRENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(
+                dot.ino, b_ino,
+                "'.' on a non-root inode must resolve to that inode"
+            );
+
+            let dotdot = state
+                .fs_lookup(b_ino, crate::FUSE_PARENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(
+                dotdot.ino, a_ino,
+                "'..' on a grandchild must resolve to its parent"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_handle_failure_releases_handle_and_writer_reference() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let full_path = Path::from_str("/dev/full").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let status = local_writer.status().clone();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            state
+                .writers
+                .insert::<FuseError>(1, fuse_writer.clone())
+                .await
+                .unwrap();
+            let handle = state
+                .insert_handle_with_writer(1, None, Some(fuse_writer.clone()), status)
+                .await;
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            let (_, first_result) = state.release_handle(1, handle.fh()).await.unwrap();
+            assert!(first_result.is_err());
+            assert!(state.find_handle(1, handle.fh()).is_err());
+            assert!(!state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_none());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_handle_failure_decrements_shared_writer_reference() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let full_path = Path::from_str("/dev/full").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let status = local_writer.status().clone();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            state
+                .writers
+                .insert::<FuseError>(1, fuse_writer.clone())
+                .await
+                .unwrap();
+            let first_handle = state
+                .insert_handle_with_writer(1, None, Some(fuse_writer.clone()), status.clone())
+                .await;
+
+            let shared_writer = state
+                .writers
+                .get_or_create(1, async { Ok::<_, FuseError>(fuse_writer.clone()) })
+                .await
+                .unwrap();
+            let second_handle = state
+                .insert_handle_with_writer(1, None, Some(shared_writer), status)
+                .await;
+
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            let (_, first_result) = state.release_handle(1, first_handle.fh()).await.unwrap();
+            assert!(first_result.is_err());
+            assert!(state.find_handle(1, first_handle.fh()).is_err());
+            assert!(state.find_handle(1, second_handle.fh()).is_ok());
+            assert!(state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_some());
+
+            let (_, second_result) = state.release_handle(1, second_handle.fh()).await.unwrap();
+            assert!(second_result.is_err());
+            assert!(state.find_handle(1, second_handle.fh()).is_err());
+            assert!(!state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_none());
+        });
+    }
+
+    /// Builds the issue-#1395 scenario: a root-level entry whose dcache inode
+    /// was removed entirely, so `get_path(ino)` fails with ENOENT.
+    /// Returns the file ino and a status snapshot with a resolvable path.
+    fn cached_then_forgotten_file(state: &NodeState, name: &str, id: i64) -> (u64, FileStatus) {
+        let mut status = FileStatus::with_name(id, name.to_string(), false);
+        status.path = format!("/{}", name);
+        let ino = {
+            let mut tree = state.dir_write();
+            let ino = tree
+                .lookup(FUSE_ROOT_ID, name, status.clone(), true)
+                .unwrap()
+                .ino;
+            // Simulate kernel FORGET; `clear()` then evicts the expired inode.
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+        state.clear().unwrap();
+        assert!(state.get_path(ino).is_err(), "ancestor must be evicted");
+        (ino, status)
+    }
+
+    #[test]
+    fn release_without_dcache_path_still_releases_handle() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+            let (ino, status) = cached_then_forgotten_file(&state, "stale", 300);
+
+            let handle = state
+                .insert_handle_with_writer(ino, None, None, status)
+                .await;
+            assert!(state.has_open_handles(ino));
+
+            let path = state.get_path(ino);
+            assert!(path.is_err(), "precondition: dcache path unavailable");
+
+            let (handle, result) = state.release_handle(ino, handle.fh()).await.unwrap();
+            assert!(result.is_ok());
+            assert!(!state.has_open_handles(ino));
+            assert!(state.find_handle(ino, handle.fh()).is_err());
+        });
+    }
+
+    #[test]
+    fn release_without_dcache_path_completes_writer() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+            let (ino, status) = cached_then_forgotten_file(&state, "stalew", 301);
+
+            let full_path = Path::from_str("/dev/null").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            state
+                .writers
+                .insert::<FuseError>(ino, fuse_writer.clone())
+                .await
+                .unwrap();
+            let handle = state
+                .insert_handle_with_writer(ino, None, Some(fuse_writer.clone()), status)
+                .await;
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            assert!(handle.has_writer());
+            let (handle, result) = state.release_handle(ino, handle.fh()).await.unwrap();
+            assert!(result.is_ok(), "writer complete must succeed: {:?}", result);
+            assert!(!state.has_open_handles(ino));
+            assert!(state.find_writer(ino).await.is_none());
+            assert!(state.find_handle(ino, handle.fh()).is_err());
+        });
+    }
+
+    /// An O_RDWR open whose reader fails after the writer reference was taken
+    /// must give that reference back; otherwise the writer never completes.
+    #[test]
+    fn rdwr_open_releases_writer_ref_when_reader_open_fails() {
+        use curvine_client::unified::UnifiedWriter;
+        use curvine_fs_api::local::LocalWriter;
+        use curvine_model::{CreateFileOptsBuilder, OpenFlags};
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            // No master is running: keep the reader's RPC retries short.
+            let mut conf = ClusterConf::default();
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let local_path = Utils::temp_file();
+            let path = Path::from_str(&local_path).unwrap();
+            let local_writer = LocalWriter::new(&path, 1).unwrap();
+            let fuse_writer = Arc::new(crate::fs::FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            assert!(!fuse_writer.is_ufs(), "reader open must be attempted");
+
+            let ino = 42;
+            state.insert_shared_writer_for_test(ino, fuse_writer).await;
+
+            let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
+            let res = state
+                .new_handle(Some(ino), &path, OpenFlags::new(libc::O_RDWR as u32), opts)
+                .await;
+            assert!(res.is_err(), "reader open must fail without a master");
+            assert!(!state.has_open_handles(ino));
+
+            // Only the pre-registered reference may remain: releasing it once
+            // must be the last release.
+            let (last, cleanup) = state
+                .writers
+                .release_with_cleanup(ino, |_| async { Ok::<(), FsError>(()) })
+                .await;
+            assert!(last, "failed open leaked a writer reference");
+            assert!(cleanup.is_ok());
+            assert!(state.find_writer(ino).await.is_none());
+
+            let _ = std::fs::remove_file(&local_path);
+        });
     }
 }

@@ -12,33 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// cmds::bench::execute monomorphizes deep UnifiedFileSystem async types.
+#![recursion_limit = "256"]
+
+mod alloc;
 mod cmds;
 mod commands;
 mod util;
 
-use clap::Parser;
+use clap::{error::ErrorKind, CommandFactory, Parser};
 use commands::Commands;
-use curvine_client::rpc::JobMasterClient;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::version;
-use orpc::common::{Logger, Utils};
-use orpc::io::net::InetAddr;
-use orpc::runtime::RpcRuntime;
-use orpc::{err_box, CommonResult};
-use std::path::{Path, PathBuf};
+use curvine_config::{ClusterConf, ConfigLoader};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_net::net::InetAddr;
+use curvine_runtime::common::{Logger, Utils};
+use curvine_runtime::runtime::RpcRuntime;
+use curvine_sys::version;
+use curvine_transfer_client::TransferClient;
+use curvine_unified_fs::UnifiedFileSystem;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(author, version = version::VERSION, about, long_about = None)]
+#[command(
+    author,
+    version = version::VERSION,
+    about,
+    long_about = None
+)]
 pub struct CurvineArgs {
+    /// Print the component version in JSON format and exit
+    #[arg(long, global = true)]
+    pub version_json: bool,
+
     /// Configuration file path (optional)
-    #[arg(
-        short,
-        long,
-        help = "Configuration file path (optional)",
-        global = true
-    )]
+    #[arg(long, help = "Configuration file path (optional)", global = true)]
     pub conf: Option<String>,
 
     /// Master address list (e.g., 'm1:8995,m2:8995')
@@ -50,7 +58,7 @@ pub struct CurvineArgs {
     pub master_addrs: Option<String>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 pub struct ConfLoadResult {
@@ -91,18 +99,16 @@ impl CurvineArgs {
 
         // Priority 2: Override with CLI master_addrs if provided
         if let Some(master_addrs) = &self.master_addrs {
-            let mut vec = vec![];
-            for node in master_addrs.split(',') {
-                let tmp: Vec<&str> = node.split(':').collect();
-                if tmp.len() != 2 {
-                    return err_box!("Invalid master_addrs format: '{}'. Expected format: 'host1:port1,host2:port2'", master_addrs);
+            let vec = match InetAddr::parse_list(master_addrs) {
+                Ok(vec) => vec,
+                Err(e) => {
+                    return err_box!(
+                        "Invalid master_addrs format: '{}'. Expected format: 'host1:port1,host2:port2': {}",
+                        master_addrs,
+                        e
+                    );
                 }
-                let hostname = tmp[0].to_string();
-                let port: u16 = tmp[1]
-                    .parse()
-                    .map_err(|_| format!("Invalid port number in master_addrs: '{}'", tmp[1]))?;
-                vec.push(InetAddr::new(hostname, port));
-            }
+            };
             conf.client.master_addrs = vec;
             source = format!("{} + --master_addrs override", source);
         }
@@ -118,52 +124,78 @@ impl CurvineArgs {
     }
 
     fn resolve_conf_path(&self, enable_default_discovery: bool) -> Option<(String, String)> {
-        if let Some(path) = &self.conf {
-            return Some((path.clone(), "--conf".to_string()));
-        }
+        // Unified discovery shared with the server/fuse/sdk entrypoints:
+        // `--conf` > CURVINE_CONF_FILE > well-known locations. When default
+        // discovery is disabled, only explicitly configured sources apply.
+        let discovered = if enable_default_discovery {
+            ConfigLoader::discover(self.conf.as_deref())
+        } else {
+            ConfigLoader::discover_configured(self.conf.as_deref())
+        }?;
 
-        if let Ok(path) = std::env::var(ClusterConf::ENV_CONF_FILE) {
-            return Some((path, ClusterConf::ENV_CONF_FILE.to_string()));
-        }
-
-        if !enable_default_discovery {
-            return None;
-        }
-
-        let mut candidates = vec![
-            (PathBuf::from("curvine-cluster.toml"), "current directory"),
-            (
-                PathBuf::from("conf/curvine-cluster.toml"),
-                "current conf directory",
-            ),
-        ];
-
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push((
-                PathBuf::from(home).join(".curvine/curvine-cluster.toml"),
-                "user config directory",
-            ));
-        }
-
-        if let Ok(curvine_home) = std::env::var("CURVINE_HOME") {
-            candidates.push((
-                Path::new(&curvine_home).join("conf/curvine-cluster.toml"),
-                "CURVINE_HOME",
-            ));
-        }
-
-        candidates
-            .into_iter()
-            .find(|(path, _)| path.exists())
-            .map(|(path, source)| (path.to_string_lossy().to_string(), source.to_string()))
+        Some((
+            discovered.path.to_string_lossy().to_string(),
+            discovered.source,
+        ))
     }
 }
 
-fn main() -> CommonResult<()> {
+fn main() -> ExitCode {
+    // Print a failure once, in Display form. Returning the error from `main`
+    // would make `Result`'s `Termination` impl print it again with `Debug`.
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Name users type for the CLI: `build/bin/cv` wraps the `curvine-cli` binary.
+const COMPLETION_BIN_NAME: &str = "cv";
+
+/// Write the completion script for `shell` to `out`.
+fn write_completion(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
+    let mut cmd = CurvineArgs::command();
+    clap_complete::generate(shell, &mut cmd, COMPLETION_BIN_NAME, out);
+}
+
+fn run() -> CommonResult<()> {
     let args = CurvineArgs::parse();
+    if args.version_json {
+        let json = match version::component_version_json("cli") {
+            Ok(json) => json,
+            Err(e) => return err_box!("Failed to serialize component version: {}", e),
+        };
+        println!("{}", json);
+        return Ok(());
+    }
+    if args.command.is_none() {
+        CurvineArgs::command()
+            .error(
+                ErrorKind::MissingSubcommand,
+                "a subcommand is required unless --version-json is provided",
+            )
+            .exit();
+    }
+
     Utils::set_panic_exit_hook();
 
-    let enable_default_discovery = matches!(args.command, Commands::Bench(_));
+    if let Some(Commands::Completion { shell }) = args.command {
+        write_completion(shell, &mut std::io::stdout());
+        return Ok(());
+    }
+
+    if matches!(args.command, Some(Commands::Version)) {
+        // Same string as `--version`: the release version plus the commit this
+        // binary was built from. Never `env!("CARGO_PKG_VERSION")`, which
+        // ignores BUILD_VERSION and reports the stale Cargo workspace number.
+        println!("curvine-cli {}", version::VERSION);
+        return Ok(());
+    }
+
+    let enable_default_discovery = matches!(args.command, Some(Commands::Bench(_)));
     let conf_load = args.get_conf_with_source(enable_default_discovery)?;
     let conf = conf_load.conf;
     let conf_source = conf_load.source;
@@ -172,29 +204,173 @@ fn main() -> CommonResult<()> {
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let fs_client = curvine_fs.fs_client();
-    let load_client = JobMasterClient::new(fs_client.clone());
+    let transfer_client = TransferClient::with_rt(&conf, rt.clone())?;
 
     rt.block_on(async move {
-        let result = match args.command {
-            Commands::Bench(cmd) => cmd.execute(curvine_fs, conf_source.clone()).await,
-            Commands::Fs(cmd) => cmd.execute(curvine_fs).await,
-            Commands::Report(cmd) => cmd.execute(curvine_fs).await,
-            Commands::Load(cmd) => cmd.execute(load_client).await,
-            Commands::LoadStatus(cmd) => cmd.execute(load_client).await,
-            Commands::CancelLoad(cmd) => cmd.execute(load_client).await,
-            Commands::Mount(cmd) => cmd.execute(curvine_fs).await,
-            Commands::UnMount(cmd) => cmd.execute(fs_client).await,
-            Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
-            Commands::Version => {
-                println!("curvine-cli {}", version::VERSION);
-                Ok(())
+        match args.command {
+            Some(Commands::Bench(cmd)) => cmd.execute(curvine_fs, conf_source.clone()).await,
+            Some(Commands::Fs(cmd)) => cmd.execute(curvine_fs).await,
+            Some(Commands::Fsck(cmd)) => cmd.execute(fs_client).await,
+            Some(Commands::Report(cmd)) => cmd.execute(curvine_fs).await,
+            Some(Commands::Load(cmd)) => {
+                cmd.execute_transfer(curvine_fs.clone(), transfer_client.clone())
+                    .await
             }
-        };
-
-        if let Err(e) = &result {
-            eprintln!("Error: {}", e);
+            Some(Commands::Export(cmd)) => {
+                cmd.execute_transfer(curvine_fs.clone(), transfer_client.clone())
+                    .await
+            }
+            Some(Commands::TransferStatus(cmd)) => {
+                cmd.execute_transfer_only(transfer_client.clone()).await
+            }
+            Some(Commands::CancelTransfer(cmd)) => {
+                cmd.execute_transfer_only(transfer_client.clone()).await
+            }
+            Some(Commands::Transfer(cmd)) => cmd.execute(transfer_client.clone()).await,
+            Some(Commands::Mount(cmd)) => cmd.execute(curvine_fs).await,
+            Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
+            Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
+            Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
+            Some(Commands::Version) | Some(Commands::Completion { .. }) | None => Ok(()),
         }
-
-        result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn export_subcommand_is_available() {
+        let args = CurvineArgs::try_parse_from(["curvine", "export", "/mnt/file", "--watch"])
+            .expect("export command should parse");
+
+        assert!(matches!(args.command, Some(Commands::Export(_))));
+    }
+
+    #[test]
+    fn fsck_flags_are_available() {
+        let args = CurvineArgs::try_parse_from([
+            "curvine",
+            "fsck",
+            "/data",
+            "--detail",
+            "--list-page-size",
+            "512",
+        ])
+        .expect("fsck command should parse");
+
+        let Some(Commands::Fsck(command)) = args.command else {
+            panic!("expected fsck command");
+        };
+        assert_eq!(command.path, "/data");
+        assert!(command.detail);
+        assert_eq!(command.list_page_size, 512);
+    }
+
+    #[test]
+    fn fsck_list_page_size_defaults_and_enforces_bounds() {
+        let args = CurvineArgs::try_parse_from(["curvine", "fsck", "/data"])
+            .expect("default fsck command should parse");
+        let Some(Commands::Fsck(command)) = args.command else {
+            panic!("expected fsck command");
+        };
+        assert_eq!(command.list_page_size, 256);
+
+        for value in ["0", "4097", "-1", "1.5", "abc"] {
+            assert!(
+                CurvineArgs::try_parse_from([
+                    "curvine",
+                    "fsck",
+                    "/data",
+                    "--list-page-size",
+                    value,
+                ])
+                .is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_create_subcommand_is_available() {
+        let args = CurvineArgs::try_parse_from(["curvine", "snapshot", "create"])
+            .expect("snapshot create should parse");
+
+        assert!(matches!(args.command, Some(Commands::Snapshot(_))));
+
+        let args = CurvineArgs::try_parse_from(["curvine", "snapshot", "create", "--force"])
+            .expect("snapshot create --force should parse");
+
+        assert!(matches!(args.command, Some(Commands::Snapshot(_))));
+    }
+
+    #[test]
+    fn version_json_does_not_require_subcommand() {
+        let args = CurvineArgs::try_parse_from(["curvine", "--version-json"])
+            .expect("version json should parse without subcommand");
+
+        assert!(args.version_json);
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn bare_invocation_parses_so_custom_missing_subcommand_path_runs() {
+        let args = CurvineArgs::try_parse_from(["curvine"])
+            .expect("bare invocation should parse so main can emit MissingSubcommand");
+
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn completion_subcommand_parses_every_shell() {
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let args = CurvineArgs::try_parse_from(["curvine", "completion", shell])
+                .unwrap_or_else(|e| panic!("completion {shell} should parse: {e}"));
+            assert!(matches!(args.command, Some(Commands::Completion { .. })));
+        }
+        assert!(CurvineArgs::try_parse_from(["curvine", "completion", "tcsh"]).is_err());
+        assert!(CurvineArgs::try_parse_from(["curvine", "completion"]).is_err());
+    }
+
+    #[test]
+    fn completion_scripts_generate_for_every_shell() {
+        use clap::ValueEnum;
+        for shell in clap_complete::Shell::value_variants() {
+            let mut out = Vec::new();
+            write_completion(*shell, &mut out);
+            let script = String::from_utf8(out).expect("completion script is UTF-8");
+            assert!(!script.is_empty(), "{shell} script is empty");
+            // Match whole words so sibling names such as `fsck` and `umount`
+            // cannot satisfy the checks for `fs` and `mount`.
+            let words: std::collections::HashSet<&str> =
+                script.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+            assert!(words.contains("cv"), "{shell} script does not mention cv");
+            for sub in ["fs", "report", "mount", "completion"] {
+                assert!(
+                    words.contains(sub),
+                    "{shell} script misses subcommand {sub}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mount_accepts_config_without_conf_short_option_collision() {
+        CurvineArgs::command().debug_assert();
+        let args = CurvineArgs::try_parse_from([
+            "curvine",
+            "--conf",
+            "curvine-cluster.toml",
+            "mount",
+            "s3://bucket/path",
+            "/bucket/path",
+            "-c",
+            "s3.endpoint_url=http://127.0.0.1:9000",
+        ])
+        .expect("mount config should use -c while cluster config uses --conf");
+
+        assert!(matches!(args.command, Some(Commands::Mount(_))));
+    }
 }

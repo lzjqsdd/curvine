@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::env;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -24,12 +23,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{Path as CurvinePath, Reader, Writer};
-use curvine_common::state::{
-    FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder,
-};
+use curvine_config::{ClusterConf, ConfigLoader};
+use curvine_error::FsError;
+use curvine_fs_api::{Path as CurvinePath, Reader, Writer};
+use curvine_io::DataSlice;
+use curvine_model::{FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder};
+use curvine_net::net::InetAddr;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use lance_core::error::Result;
@@ -48,8 +47,6 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use once_cell::sync::Lazy;
-use orpc::io::net::InetAddr;
-use orpc::sys::DataSlice;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use url::Url;
@@ -187,11 +184,14 @@ fn resolve_curvine_conf(params: &ObjectStoreParams) -> Result<ClusterConf> {
         return cluster_conf_from_master_addrs(&master_addrs);
     }
 
-    if let Ok(conf_path) = env::var(ClusterConf::ENV_CONF_FILE) {
-        return ClusterConf::from(&conf_path).map_err(|e| {
+    // Same unified discovery as the other entrypoints, restricted to
+    // explicitly configured sources: the storage option (checked above) or the
+    // CURVINE_CONF_FILE environment variable.
+    if let Some(found) = ConfigLoader::discover_configured(None) {
+        return ClusterConf::from(found.as_str()).map_err(|e| {
             LanceError::invalid_input(format!(
                 "Failed to load Curvine configuration from '{}': {e}",
-                conf_path
+                found.as_str()
             ))
         });
     }
@@ -270,8 +270,8 @@ fn curvine_store_identity(
         ));
     }
 
-    if let Ok(conf_path) = env::var(ClusterConf::ENV_CONF_FILE) {
-        return curvine_conf_identity(&conf_path);
+    if let Some(found) = ConfigLoader::discover_configured(None) {
+        return curvine_conf_identity(found.as_str().as_ref());
     }
 
     curvine_absolute_path_str_from_uri(url)
@@ -482,6 +482,8 @@ impl ObjectStoreTrait for CurvineObjectStore {
             None => 0..meta.size,
         };
 
+        // Stop pipelined prefetch at the range end instead of reading past it.
+        reader.set_read_end(range.end as i64);
         if range.start > 0 {
             reader
                 .seek(range.start as i64)
@@ -1356,7 +1358,7 @@ impl CurvineObjectStore {
         dirs.sort_by(|left, right| right.full_path().len().cmp(&left.full_path().len()));
         for dir in dirs {
             match self.context.fs.delete(&dir, false).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(FsError::DirNotEmpty(_)) => {}
                 Err(e) if is_not_found_error(&e) => {}
                 Err(e) => return Err(fs_error_to_object_store(location, e)),
@@ -1409,7 +1411,7 @@ impl CurvineObjectStore {
             }
 
             match self.context.fs.delete(&dir, false).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(FsError::DirNotEmpty(_)) => break,
                 Err(e) if is_not_found_error(&e) => break,
                 Err(e) => return Err(fs_error_to_object_store(location, e)),
@@ -1839,6 +1841,9 @@ fn conditional_lock(owner_id: u64, lock_type: LockType) -> FileLock {
         lock_flags: LockFlags::Flock,
         start: 0,
         end: u64::MAX,
+        // The synthetic client id above never owns a master session lease, so
+        // this lock keeps the legacy `lock_expire_time` reclamation path.
+        session_owned: false,
     }
 }
 
@@ -1871,7 +1876,9 @@ fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {
             path: location.to_string(),
             source: Box::new(e),
         },
-        e @ FsError::Unsupported(_) | e @ FsError::UnsupportedUfsRead(_) => OsError::NotSupported {
+        e @ FsError::Unsupported(_)
+        | e @ FsError::UnsupportedUfsRead(_)
+        | e @ FsError::ReadOnly(_) => OsError::NotSupported {
             source: Box::new(e),
         },
         e => OsError::Generic {
@@ -1931,6 +1938,14 @@ mod tests {
         let message = "[curvine-master] ERROR: File /tmp/lancedb/events.lance/_versions not exists(curvine-server/src/master/meta/fs_dir.rs:452): ";
 
         assert!(is_curvine_missing_common_message(message));
+    }
+
+    #[test]
+    fn readonly_fs_error_maps_to_object_store_not_supported() {
+        let location = Path::from("dataset.lance");
+        let err = fs_error_to_object_store(&location, FsError::read_only("read-only mount"));
+
+        assert!(matches!(err, OsError::NotSupported { .. }));
     }
 
     #[test]

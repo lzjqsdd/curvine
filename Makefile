@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down all dist dist-only
+.PHONY: help check-env check-client-deps check-api-crate-deps check-minimal-artifact-deps format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -20,6 +20,9 @@ help:
 	@echo ""
 	@echo "Environment:"
 	@echo "  make check-env                   - Check build environment dependencies"
+	@echo "  make check-client-deps           - Enforce client-side dependency boundary guardrails"
+	@echo "  make check-api-crate-deps        - Enforce lightweight API/domain crate dependency boundaries"
+	@echo "  make check-minimal-artifact-deps - Enforce runtime deps on built minimal client artifacts"
 	@echo ""
 	@echo "Building:"
 	@echo "  make build ARGS='<args>'         - Build with specific arguments passed to build.sh"
@@ -27,15 +30,12 @@ help:
 	@echo "  make dist                        - Build and create distribution package (tar.gz)"
 	@echo "  make dist-only                   - Create distribution package without building"
 	@echo "  make format                      - Format Rust code using pre-commit hooks"
-	@echo "  make format-csi                  - Format curvine-csi Go code"
+	@echo "  make format-csi                  - Check curvine-csi Go formatting and run go vet"
 	@echo ""
 	@echo "Docker:"
 	@echo "  make docker-build                - Build runtime Docker image from source (compile + package)"
 	@echo "  make docker-build-compile         - Build compilation Docker image (interactive)"
 	@echo "  make docker-compile               - Compile code in Docker container (output to local build/dist)"
-	@echo ""
-	@echo "Fluid (Kubernetes):"
-	@echo "  make docker-build-fluid          - Build unified Fluid Docker image (supports both cache-runtime and thin-runtime)"
 	@echo ""
 	@echo "CSI (Container Storage Interface):"
 	@echo "  make curvine-csi                 - Build curvine-csi Docker image"
@@ -72,7 +72,6 @@ help:
 	@echo "  RELEASE_VERSION=v1.0.0 make dist           - Build and package with specific version"
 	@echo "  make cargo ARGS='test --verbose'            - Run cargo test with verbose output"
 	@echo "  make curvine-csi                            - Build curvine-csi Docker image"
-	@echo "  make docker-build-fluid                  - Build unified Fluid Docker image"
 	@echo "  make docker-build-spdk-target             - Build SPDK NVMe-oF target image"
 
 	@echo "  make docker-compose-spdk                  - Start SPDK dev/test stack"
@@ -81,11 +80,23 @@ help:
 check-env:
 	$(SHELL_CMD) build/check-env.sh $(filter --skip-java-sdk --skip-python-sdk,$(ARGS))
 
+# 1.1. Enforce current client dependency boundaries
+check-client-deps:
+	$(SHELL_CMD) scripts/check-deps.sh --mode ci
+
+# 1.1. Enforce lightweight API/domain crate dependency boundaries
+check-api-crate-deps:
+	$(SHELL_CMD) scripts/check-api-crate-deps.sh
+
+# 1.2. Enforce runtime dependency boundaries for built minimal artifacts
+check-minimal-artifact-deps:
+	$(SHELL_CMD) scripts/check-minimal-artifact-deps.sh
+
 # 2. Format the project
 format:
 	$(SHELL_CMD) build/pre-commit.sh
 
-# 2.1. Format curvine-csi Go code
+# 2.1. Check curvine-csi Go formatting and run go vet
 format-csi:
 	$(SHELL_CMD) build/format-csi.sh
 
@@ -123,36 +134,6 @@ docker-build-compile:
 docker-compile:
 	@echo "Compiling code in Docker container..."
 	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached bash -c "make all"
-
-# 7.1. Build Fluid CacheRuntime Docker image
-docker-build-fluid-cache:
-	@echo "Building Fluid CacheRuntime Docker image..."
-	@bash curvine-docker/fluid/cache-runtime/build-image.sh
-
-# 7.2. Build Fluid ThinRuntime Docker image
-docker-build-fluid-thin:
-	@echo "Building Fluid ThinRuntime Docker image..."
-	@bash curvine-docker/fluid/thin-runtime/build-image.sh
-
-# 7.3. Build unified Fluid Docker image
-docker-build-fluid:
-	@echo "Building unified Fluid Docker image..."
-	@echo "This image supports both cache-runtime and thin-runtime modes"
-	@if ! docker image inspect ghcr.io/curvineio/curvine:latest >/dev/null 2>&1; then \
-		echo "Warning: Base image ghcr.io/curvineio/curvine:latest not found locally."; \
-		echo "Attempting to pull from registry..."; \
-		docker pull ghcr.io/curvineio/curvine:latest || \
-		(echo "Error: Failed to pull base image. Please build it first with 'make docker-build' or pull from registry." && exit 1); \
-	fi
-	@cd curvine-docker/fluid && docker build -f Dockerfile -t curvine-fluid:latest .
-	@echo "✓ Unified Fluid Docker image built successfully: curvine-fluid:latest"
-	@echo ""
-	@echo "Usage examples:"
-	@echo "  # CacheRuntime mode:"
-	@echo "  docker run -e FLUID_RUNTIME_COMPONENT_TYPE=master curvine-fluid:latest master start"
-	@echo ""
-	@echo "  # ThinRuntime mode:"
-	@echo "  docker run curvine-fluid:latest fluid-thin-runtime"
 
 # 8. CSI (Container Storage Interface) target
 .PHONY: curvine-csi
@@ -246,40 +227,35 @@ build-hdfs: check-env
 all: build
 
 # 12. Distribution packaging
+VERSION_SH := build/version.sh
+
 dist: all
 	@$(MAKE) dist-only
 
+# The package version comes from the same resolver build.sh uses, so the
+# tar.gz here and the zip from build.sh are named after the same git identity
+# (tag when HEAD is tagged, else branch, always with the short commit).
+# BUILD_VERSION / RELEASE_VERSION still override, for release CI.
 dist-only:
 	@echo "Creating distribution package..."
 	@if [ ! -d "build/dist" ]; then \
 		echo "Error: build/dist directory not found. Please run 'make all' first."; \
 		exit 1; \
 	fi
-	@# Get version from environment variable only
-	@PLATFORM=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	@. $(VERSION_SH); \
+	PLATFORM=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
 	ARCH=$$(uname -m); \
-	if [ -n "$$RELEASE_VERSION" ]; then \
-		VERSION="$$RELEASE_VERSION"; \
-		echo "Using provided version: $$VERSION"; \
-		if [ -n "$$GITHUB_ACTIONS" ]; then \
-			DIST_NAME="curvine-$${VERSION}-$${PLATFORM}-$${ARCH}"; \
-			echo "GitHub Actions detected - using clean naming"; \
-		else \
-			TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
-			DIST_NAME="curvine-$${VERSION}-$${PLATFORM}-$${ARCH}-$${TIMESTAMP}"; \
-			echo "Local build - adding timestamp"; \
-		fi; \
-	else \
-		echo "No version provided via RELEASE_VERSION environment variable"; \
-		if [ -n "$$GITHUB_ACTIONS" ]; then \
-			DIST_NAME="curvine-$${PLATFORM}-$${ARCH}"; \
-			echo "GitHub Actions detected - no version in package name"; \
-		else \
-			TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
-			DIST_NAME="curvine-$${PLATFORM}-$${ARCH}-$${TIMESTAMP}"; \
-			echo "Local build - no version, adding timestamp"; \
-		fi; \
+	if [ -n "$$RELEASE_VERSION" ] && [ -z "$$BUILD_VERSION" ]; then \
+		BUILD_VERSION=$$(tag_to_release_version "$$RELEASE_VERSION"); \
+		export BUILD_VERSION; \
 	fi; \
+	VERSION=$$(get_package_version Cargo.toml .); \
+	if [ -z "$$VERSION" ]; then \
+		echo "Error: failed to resolve package version" >&2; \
+		exit 1; \
+	fi; \
+	DIST_NAME="curvine-$${VERSION}-$${PLATFORM}-$${ARCH}"; \
+	echo "Package version: $$VERSION"; \
 	echo "Packaging as: $${DIST_NAME}.tar.gz"; \
 	cd build/dist && tar -czf "../../$${DIST_NAME}.tar.gz" . && cd ../..; \
 	echo "Distribution package created: $${DIST_NAME}.tar.gz"; \

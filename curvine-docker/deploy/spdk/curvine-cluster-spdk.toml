@@ -4,6 +4,38 @@
 format_master = true  
 format_worker = true  
 
+# Network interface (e.g. "eth0") used to auto-resolve this node's local IPv4.  
+# When set (non-empty), on startup the resolved IPv4 is applied to the  
+# master/journal/worker/client hostnames, and the CURVINE_*_HOSTNAME env vars  
+# are ignored. When empty (the default), hostnames come from the config below  
+# and may be overridden by the CURVINE_*_HOSTNAME env vars.  
+#  
+# Multi-node note: this only fills THIS node's own hostname. The cluster  
+# membership lists (journal.journal_addrs and client.master_addrs) must still  
+# be written out explicitly, and each node's entry must use the exact IPv4 that  
+# its interface resolves to -- otherwise the node cannot locate itself in the  
+# raft group and startup fails with a clear error.  
+# net_interface = "eth0"  
+
+# Service discovery is disabled by default. When enabled, the first provider is
+# etcd over internal cluster networking; auth/TLS settings are intentionally not
+# part of the first phase.
+[discovery]
+enabled = false
+provider = "etcd"
+# Set when enabled, for example: ["http://etcd-0:2379", "http://etcd-1:2379"]
+endpoints = []
+# Etcd key prefix. Effective keys are {prefix}/{cluster_id}/services/{kind}/{service_id}.
+prefix = "/curvine"
+connect_timeout_ms = 3000
+request_timeout_ms = 3000
+# Watch reconnect uses exponential backoff between min/max with this jitter ratio.
+watch_reconnect_min_ms = 1000
+watch_reconnect_max_ms = 30000
+watch_reconnect_jitter_ratio = 0.2
+# If false, resolver snapshot() returns StaleCache while watch is disconnected.
+allow_stale_cache = true
+
 # master configuration  
 [master]  
 meta_dir = "testing/meta"  
@@ -36,6 +68,9 @@ enabled = true
 app_name = "curvine"  
 hugepage = "10MB"
 reactor_mask = "0x30"  
+# iova_mode = "va"  # set on VM/container hosts if env_init fails with PA IOVA error
+# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").
+# qpair_acquire_timeout = "30s"
 # NVMe-oF targets  
 [[worker.spdk_disk.targets]]
 trtype = "tcp"  
@@ -47,6 +82,14 @@ subnqn = "nqn.2026-05.curvine:cnode1"
 # Client configuration  
 [client]
 short_circuit = false
+
+[transfer]
+# Transfer is embedded in the master (no standalone endpoints configured).
+rpc_port = 9010
+web_port = 9011
+client_pending_queue_size = 1024
+client_submit_concurrency = 64
+log = { level = "debug", log_dir = "stdout", file_name = "transfer.log" }
 
 # fuse configuration  
 [fuse]  

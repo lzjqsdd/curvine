@@ -14,14 +14,13 @@
 
 use crate::raw::fuse_abi::*;
 use crate::{err_fuse, FuseResult};
+use bytes::Bytes;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Formatter};
-use tokio_util::bytes::Bytes;
 
 #[derive(Debug)]
 pub enum FuseOperator<'a> {
     Notimplemented,
-    Empty,
     Init(Init<'a>),
     StatFs(StatFs<'a>),
     ReadDir(ReadDir<'a>),
@@ -54,11 +53,14 @@ pub enum FuseOperator<'a> {
     Interrupt(Interrupt<'a>),
     ListXAttr(ListXAttr<'a>),
     FSync(FSync<'a>),
+    FSyncDir(FSyncDir<'a>),
+    Destroy(Destroy<'a>),
     Symlink(Symlink<'a>),
     Readlink(Readlink<'a>),
     GetLk(GetLk<'a>),
     SetLk(SetLk<'a>),
     SetLkW(SetLkW<'a>),
+    Ioctl(Ioctl<'a>),
 }
 
 #[repr(i8)]
@@ -111,7 +113,6 @@ impl OpenAction {
     }
 }
 
-// View file and directory information. ls, ll command
 #[derive(Debug)]
 pub struct StatFs<'a> {
     pub header: &'a fuse_in_header,
@@ -135,10 +136,10 @@ pub struct Lookup<'a> {
     pub name: &'a OsStr,
 }
 
-// Get file attributes.
 #[derive(Debug)]
 pub struct GetAttr<'a> {
     pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_getattr_in,
 }
 
 #[derive(Debug)]
@@ -161,33 +162,24 @@ pub struct MkDir<'a> {
     pub name: &'a OsStr,
 }
 
-// Preallocate disk space.
 #[derive(Debug)]
 pub struct FAllocate<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_fallocate_in,
 }
 
-// Request to destroy the file system.
 #[derive(Debug)]
 pub struct Destroy<'a> {
     pub header: &'a fuse_in_header,
 }
 
-/// When the kernel no longer needs information about an inode, it will send a Forget request to the user state
-/// The user-state file system should clean up the resources of the corresponding node when receiving the Forget request to free up memory or other resources.
-/// The main purpose of this interface is to maintain the reference count of file system nodes and ensure that no longer needed nodes are properly released.
-///
-///Each node in the file system has a reference count, recording how many paths are pointing to the node.
-// When the reference count of a node decreases to zero, it means that there is no path pointing to the node and its resources can be safely released.
-// Forget requests to notify the user-state file system that the reference count of a node needs to be reduced.
+/// Kernel forget request used to drop inode references and release cached resources.
 #[derive(Debug)]
 pub struct Forget<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_forget_in,
 }
 
-/// Create and open a file.
 #[derive(Debug)]
 pub struct Create<'a> {
     pub header: &'a fuse_in_header,
@@ -195,21 +187,18 @@ pub struct Create<'a> {
     pub name: &'a OsStr,
 }
 
-/// Open a file and perform read or write operations.
 #[derive(Debug)]
 pub struct Open<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_open_in,
 }
 
-// Read data.
 #[derive(Debug)]
 pub struct Read<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_read_in,
 }
 
-// Write data.
 pub struct Write<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_write_in,
@@ -245,15 +234,8 @@ pub struct GetXAttr<'a> {
     pub name: &'a OsStr,
 }
 
-/// SetXAttr request structure:
-/// ```text
-/// +0                         +40                    +56           +56+len(name)+1
-/// |--------------------------|---------------------|-------------|--------------------------|
-/// |    fuse_in_header        | fuse_setxattr_in    |    name     |    value                 |
-/// |      (40 bytes)          |     (16 bytes)      | (variable)  | (size bytes)             |
-/// |--------------------------|---------------------|-------------|--------------------------|
-/// ```
-
+/// SetXAttr request layout.
+/// Header + `fuse_setxattr_in` + name + value.
 #[derive(Debug)]
 pub struct SetXAttr<'a> {
     pub header: &'a fuse_in_header,
@@ -319,7 +301,6 @@ pub struct BatchForget<'a> {
     pub nodes: Vec<&'a fuse_forget_one>,
 }
 
-// Rename a file.
 #[derive(Debug)]
 pub struct Rename<'a> {
     pub header: &'a fuse_in_header,
@@ -355,21 +336,24 @@ pub struct FSync<'a> {
     pub arg: &'a fuse_fsync_in,
 }
 
-/// ```txt
-/// /linkname -> /target_path
-/// linkname: /linkname
-/// target: /target_path
-/// ```
+// Directory fsync: FSYNC is stream-routed, FSYNCDIR is meta-routed.
+#[derive(Debug)]
+pub struct FSyncDir<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_fsync_in,
+}
+
+/// Symlink request layout.
+/// `linkname` is the created link and `target` is the destination path.
 #[derive(Debug)]
 pub struct Symlink<'a> {
     pub header: &'a fuse_in_header,
     // symlink name
     pub linkname: &'a OsStr,
-    // target name that the symlink point to
+    // symlink target path
     pub target: &'a OsStr,
 }
 
-// Read the target of a symbolic link.
 #[derive(Debug)]
 pub struct Readlink<'a> {
     pub header: &'a fuse_in_header,
@@ -391,4 +375,11 @@ pub struct SetLk<'a> {
 pub struct SetLkW<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_lk_in,
+}
+
+#[derive(Debug)]
+pub struct Ioctl<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_ioctl_in,
+    pub in_data: &'a [u8],
 }

@@ -4,12 +4,13 @@ This module provides the CurvineClient class which serves as the primary
 interface for interacting with the Curvine distributed file system.
 """
 from typing import Any, Dict, List, Optional, Union
+import warnings
 
 import curvine_libsdk
 from curvine_libsdk._proto.common_pb2 import FileStatusProto
 from curvine_libsdk._proto.master_pb2 import (
     GetFileStatusResponse,
-    GetMasterInfoResponse,
+    GetFilesystemInfoResponse,
     ListStatusResponse,
 )
 
@@ -85,7 +86,7 @@ class CurvineClient:
         }
         return file_status_dict
 
-    def get_master_info(self) -> Dict[str, Any]:
+    def get_filesystem_info(self) -> Dict[str, Any]:
         """Get information about the Curvine cluster.
 
         Returns:
@@ -106,13 +107,13 @@ class CurvineClient:
                 - lost_workers: List of lost workers
 
         Raises:
-            IOError: If getting master info fails.
+            IOError: If getting filesystem info fails.
         """
         try:
-            status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_master_info(self.file_system_ptr)
+            status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_filesystem_info(self.file_system_ptr)
         except Exception as e:
-            raise IOError(f"Native get master information failed: {e}")
-        status = GetMasterInfoResponse()
+            raise IOError(f"Native get filesystem information failed: {e}")
+        status = GetFilesystemInfoResponse()
         status.ParseFromString(status_bytes)
         status_dict = {
             "active_master": status.active_master,
@@ -131,6 +132,20 @@ class CurvineClient:
             "lost_workers": list(status.lost_workers),
         }
         return status_dict
+
+    def get_master_info(self) -> Dict[str, Any]:
+        """Deprecated alias of :meth:`get_filesystem_info`.
+
+        The RPC returns whole-filesystem statistics, not master-process
+        information. Kept for source compatibility; will be removed in a
+        future release.
+        """
+        warnings.warn(
+            "get_master_info() is deprecated, use get_filesystem_info()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_filesystem_info()
 
     def mkdir(self, path: str, create_parents: bool) -> None:
         """Create a directory.
@@ -155,19 +170,22 @@ class CurvineClient:
         if not is_success:
             raise IOError("mkdir failed")
 
-    def rm(self, path: str, recursive: bool = False) -> None:
+    def rm(self, path: str, recursive: bool = False, async_delete: bool = False) -> None:
         """Delete a file or directory.
 
         Args:
             path: Path to delete.
             recursive: If True, delete directories recursively.
+            async_delete: If True, return once the name leaves the namespace and
+                let the master reclaim the blocks in the background. Mounted
+                paths stay synchronous.
 
         Raises:
             IOError: If deletion fails.
         """
         try:
             curvine_libsdk.python_io_curvine_curvine_native_delete(
-                self.file_system_ptr, path, recursive
+                self.file_system_ptr, path, recursive, async_delete
             )
         except Exception as e:
             raise IOError(f"Native delete file failed: {e}")
@@ -348,7 +366,7 @@ class CurvineClient:
         Raises:
             ValueError: If size is negative or None.
         """
-        if size < 0 or size is None:
+        if size is None or size < 0:
             raise ValueError("size must be non-negative integer")
 
         return self.read_range(path, 0, size)
@@ -364,12 +382,15 @@ class CurvineClient:
             The last N bytes of the file.
 
         Raises:
-            ValueError: If size is negative.
+            ValueError: If size is negative or None.
+            FileNotFoundError: If file not found.
         """
-        if size < 0:
+        if size is None or size < 0:
             raise ValueError("size must be non-negative")
 
         file_status = self.get_file_status(path)
+        if file_status is None:
+            raise FileNotFoundError("File not found")
         file_length = file_status["len"]
 
         if file_length == 0:

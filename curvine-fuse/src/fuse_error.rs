@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::error::FsError;
-use orpc::io::IOError;
-use orpc::CommonError;
+use curvine_core_error::CommonError;
+use curvine_error::FsError;
+use curvine_io::IOError;
 use std::fmt;
 use std::fmt::Debug;
 use tokio::time::error::Elapsed;
@@ -26,14 +26,49 @@ pub struct FuseError {
 }
 
 impl FuseError {
-    pub fn new(errno: i32, error: CommonError) -> Self {
+    // Keep raw construction crate-private; public construction normalizes errno.
+    pub(crate) fn new(errno: i32, error: CommonError) -> Self {
+        // FuseError always stores a positive errno; replies encode it as `-error`.
+        debug_assert!(
+            errno > 0,
+            "FuseError errno must be a positive POSIX errno, got {}",
+            errno
+        );
         Self { errno, error }
     }
 
-    /// The POSIX errno this error maps to. Used by the metrics finish path to
-    /// stash the errno label source.
+    /// Build a `FuseError` from any errno-like value after normalizing it.
+    pub fn from_errno_msg<E: TryInto<i32>>(errno: E, error: CommonError) -> Self {
+        Self::new(normalize_errno(errno), error)
+    }
+
+    /// Preserve an OS errno for daemon startup failures without changing the
+    /// established EIO normalization used by runtime request paths.
+    pub(crate) fn from_startup_io_error(value: IOError) -> Self {
+        let errno = value.raw_error().raw_os_error().unwrap_or(libc::EIO);
+        Self::from_errno_msg(errno, value.into())
+    }
+
     pub(crate) fn errno(&self) -> i32 {
         self.errno
+    }
+
+    pub fn is_enoent(&self) -> bool {
+        self.errno == libc::ENOENT
+    }
+}
+
+/// Normalize arbitrary errno input into a positive POSIX errno, falling back to `EIO`.
+pub(crate) fn normalize_errno<E: TryInto<i32>>(errno: E) -> i32 {
+    match errno.try_into() {
+        Ok(e) if e > 0 => e,
+        _ => {
+            debug_assert!(
+                false,
+                "err_fuse! errno is non-positive or out of i32 range; falling back to EIO"
+            );
+            libc::EIO
+        }
     }
 }
 
@@ -47,7 +82,7 @@ impl std::error::Error for FuseError {}
 
 impl fmt::Display for FuseError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "errno {}: {}", self.error, self.errno)
+        write!(fmt, "errno {}: {}", self.errno, self.error)
     }
 }
 
@@ -71,46 +106,53 @@ impl From<IOError> for FuseError {
 
 impl From<FsError> for FuseError {
     fn from(value: FsError) -> Self {
-        // Map well-known FsError kinds directly to POSIX errno
-        let mapped = match &value {
-            FsError::FileAlreadyExists(_) => Some(libc::EEXIST),
-            FsError::FileNotFound(_) => Some(libc::ENOENT),
-            FsError::DirNotEmpty(_) => Some(libc::ENOTEMPTY),
-            FsError::IsADirectory(_) => Some(libc::EISDIR),
-            FsError::ParentNotDir(_) => Some(libc::ENOTDIR),
-            FsError::NotADirectory(_) => Some(libc::ENOTDIR),
-            FsError::InvalidPath(_) => Some(libc::EINVAL),
-            FsError::InvalidFileSize(_) => Some(libc::EFBIG),
-            FsError::InvalidArgument(_) => Some(libc::EINVAL),
-            FsError::DiskOutOfSpace(_) => Some(libc::ENOSPC),
-            FsError::Timeout(_) => Some(libc::ETIMEDOUT),
-            FsError::Unsupported(_) => Some(libc::ENOSYS),
-            FsError::InProgress(_) => Some(libc::EBUSY),
-            FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
-            _ => None,
-        };
-
-        if let Some(errno) = mapped {
-            return Self::new(errno, value.into());
-        }
-
-        // Fallback: infer from message content for UFS/common errors (e.g., opendal PermissionDenied)
-        let msg = value.to_string().to_lowercase();
-        if msg.contains("permission denied") || msg.contains("os error 13") {
-            return Self::new(libc::EACCES, value.into());
-        }
-        if msg.contains("not implemented") || msg.contains("unsupported") {
-            return Self::new(libc::ENOSYS, value.into());
-        }
-
-        // Default to EIO
-        Self::new(libc::EIO, value.into())
+        let errno = errno_of(&value);
+        Self::new(errno, value.into())
     }
+}
+
+/// The POSIX errno an `FsError` maps to, computed without consuming it.
+pub(crate) fn errno_of(value: &FsError) -> i32 {
+    let mapped = match value {
+        FsError::FileAlreadyExists(_) => Some(libc::EEXIST),
+        FsError::FileNotFound(_) => Some(libc::ENOENT),
+        FsError::DirNotEmpty(_) => Some(libc::ENOTEMPTY),
+        FsError::IsADirectory(_) => Some(libc::EISDIR),
+        FsError::ParentNotDir(_) => Some(libc::ENOTDIR),
+        FsError::NotADirectory(_) => Some(libc::ENOTDIR),
+        FsError::InvalidPath(_) => Some(libc::EINVAL),
+        FsError::InvalidFileSize(_) => Some(libc::EFBIG),
+        FsError::InvalidArgument(_) => Some(libc::EINVAL),
+        FsError::DiskOutOfSpace(_) => Some(libc::ENOSPC),
+        FsError::Timeout(_) => Some(libc::ETIMEDOUT),
+        FsError::Unsupported(_) => Some(libc::ENOSYS),
+        FsError::InProgress(_) => Some(libc::EBUSY),
+        FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
+        FsError::ReadOnly(_) => Some(libc::EROFS),
+        _ => None,
+    };
+
+    if let Some(errno) = mapped {
+        return errno;
+    }
+
+    // Fallback: infer from message content for UFS/common errors (e.g., opendal PermissionDenied)
+    let msg = value.to_string().to_lowercase();
+    if msg.contains("permission denied") || msg.contains("os error 13") {
+        return libc::EACCES;
+    }
+    if msg.contains("not implemented") || msg.contains("unsupported") {
+        return libc::ENOSYS;
+    }
+
+    libc::EIO
 }
 
 impl From<Elapsed> for FuseError {
     fn from(value: Elapsed) -> Self {
-        Self::new(libc::EIO, value.into())
+        // A tokio timeout is a timeout, same as FsError::Timeout -> ETIMEDOUT;
+        // keep both conversion paths consistent instead of degrading to EIO.
+        Self::new(libc::ETIMEDOUT, value.into())
     }
 }
 
@@ -120,16 +162,6 @@ impl From<std::io::Error> for FuseError {
     }
 }
 
-/// Maps an errno integer to a stable, low-cardinality symbolic `&'static str`
-/// label, suitable for the `errno` label on error metrics. Zero-allocation: the
-/// metrics hot path must never format the raw integer or a libc-locale string.
-///
-/// The table is the closed set of errnos actually produced in the FUSE layer
-/// (verified against `libc::E*` usage across `curvine-fuse/src/` plus the
-/// `FsError -> errno` mapping above). Any errno outside the table collapses to
-/// `"OTHER"`; if a new errno starts being produced, add it here and to the
-/// design doc's label table together.
-// Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
 #[allow(dead_code)]
 pub(crate) fn errno_label(errno: i32) -> &'static str {
     match errno {
@@ -157,21 +189,18 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
         libc::EBUSY => "EBUSY",
         libc::ENAMETOOLONG => "ENAMETOOLONG",
         libc::EFBIG => "EFBIG",
+        libc::EROFS => "EROFS",
         _ => "OTHER",
     }
 }
 
-/// Low-cardinality lowercase label for a splice/receive errno, used by
-/// `receive_errors_total{errno}`. Deliberately separate from [`errno_label`]:
-/// receive errors occur before a request is decoded and the design fixes this
-/// to the small lowercase set the receiver loop actually matches on, rather
-/// than the full uppercase POSIX table.
 pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
     match errno {
         libc::ENOENT => "enoent",
         libc::EINTR => "eintr",
         libc::EAGAIN => "eagain",
         libc::ENODEV => "enodev",
+        libc::ECONNABORTED => "econnaborted",
         _ => "other",
     }
 }
@@ -179,7 +208,35 @@ pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{errno_label, splice_errno_label, FuseError};
-    use curvine_common::error::FsError;
+    use curvine_error::FsError;
+    use curvine_io::IOError;
+
+    // Display prints the errno NUMBER first, then the message ("errno 2: ...").
+    #[test]
+    fn display_prints_errno_before_message() {
+        let err = FuseError::new(libc::ENOENT, "no such file".into());
+        let s = format!("{}", err);
+        assert!(
+            s.starts_with(&format!("errno {}: ", libc::ENOENT)),
+            "expected errno number first, got: {}",
+            s
+        );
+        assert!(s.contains("no such file"));
+    }
+
+    // A tokio timeout maps to ETIMEDOUT, consistent with FsError::Timeout — not EIO.
+    #[tokio::test]
+    async fn elapsed_maps_to_etimedout() {
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_millis(0),
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("zero-duration timeout must elapse");
+        let err: FuseError = elapsed.into();
+        assert_eq!(err.errno, libc::ETIMEDOUT);
+        assert_eq!(errno_label(err.errno), "ETIMEDOUT");
+    }
 
     #[test]
     fn invalid_file_size_maps_to_efbig() {
@@ -189,9 +246,30 @@ mod tests {
     }
 
     #[test]
+    fn disk_out_of_space_maps_to_enospc() {
+        let err: FuseError = FsError::disk_out_of_space("strict free_ratio floor").into();
+        assert_eq!(err.errno, libc::ENOSPC);
+        assert_eq!(errno_label(err.errno), "ENOSPC");
+    }
+
+    #[test]
+    fn read_only_maps_to_erofs() {
+        let err: FuseError = FsError::read_only("/mnt/ro").into();
+        assert_eq!(err.errno, libc::EROFS);
+        assert_eq!(errno_label(err.errno), "EROFS");
+    }
+
+    #[test]
+    fn startup_io_error_preserves_os_errno() {
+        let error = IOError::from(std::io::Error::from_raw_os_error(libc::EPERM));
+        let error = FuseError::from_startup_io_error(error);
+
+        assert_eq!(error.errno, libc::EPERM);
+        assert!(error.to_string().contains("Operation not permitted"));
+    }
+
+    #[test]
     fn errno_label_maps_the_closed_set() {
-        // Full (errno, expected-label) table. Any accidental relabeling must
-        // update this table and the design doc's errno Label rules together.
         let table = [
             (libc::ENOENT, "ENOENT"),
             (libc::EIO, "EIO"),
@@ -217,6 +295,7 @@ mod tests {
             (libc::EBUSY, "EBUSY"),
             (libc::ENAMETOOLONG, "ENAMETOOLONG"),
             (libc::EFBIG, "EFBIG"),
+            (libc::EROFS, "EROFS"),
         ];
         for (e, expected) in table {
             assert_eq!(errno_label(e), expected, "label mismatch for errno {}", e);
@@ -238,6 +317,7 @@ mod tests {
         assert_eq!(splice_errno_label(libc::EINTR), "eintr");
         assert_eq!(splice_errno_label(libc::EAGAIN), "eagain");
         assert_eq!(splice_errno_label(libc::ENODEV), "enodev");
+        assert_eq!(splice_errno_label(libc::ECONNABORTED), "econnaborted");
         // Anything else (incl. 0 / unknown) collapses to lowercase "other".
         assert_eq!(splice_errno_label(libc::EIO), "other");
         assert_eq!(splice_errno_label(0), "other");

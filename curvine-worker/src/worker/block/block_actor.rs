@@ -1,0 +1,658 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::worker::block::{
+    BlockMeta, BlockStore, ChecksumScan, HeartbeatTask, MasterClient, MasterClientConfig,
+};
+use curvine_client_core::file::FsContext;
+use curvine_config::ClusterConf;
+use curvine_core_error::{CommonError, CommonResult};
+use curvine_error::FsError;
+use curvine_model::ProtoUtils;
+use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_proto::BlockReportListResponse;
+use curvine_rpc::server::ServerState;
+use curvine_runtime::common::TimeSpent;
+use curvine_runtime::runtime::ScheduledExecutor;
+use curvine_runtime::runtime::{GroupExecutor, Runtime};
+use curvine_runtime::sync::StateCtl;
+use dashmap::{DashMap, DashSet};
+use log::{info, warn};
+use std::mem::size_of_val;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub(crate) struct BlockActorConfig {
+    pub(crate) worker_addr: WorkerAddress,
+    pub(crate) worker_session_id: String,
+    pub(crate) worker_ctl: StateCtl,
+    pub(crate) startup_time_ms: u64,
+    pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+}
+
+/// Attempts per full block report batch, including the first one.
+///
+/// Each attempt is a full connector RPC that retries internally, so with the
+/// default client config (120s rpc timeout + 120s retry window) a sustained
+/// failure takes about `3 * 240s + 3s` (~12 min) before startup fails.
+const FULL_REPORT_MAX_ATTEMPTS: u32 = 3;
+/// Backoff before the first retry; doubled on every further retry.
+const FULL_REPORT_RETRY_BASE: Duration = Duration::from_secs(1);
+/// Upper bound of the backoff between two attempts.
+const FULL_REPORT_RETRY_MAX: Duration = Duration::from_secs(10);
+/// Rounds a master may ask the worker to resend before startup fails.
+///
+/// A master that missed the earlier batches of a round cannot complete it, so
+/// the worker resends the round from the first batch under a new report id. The
+/// budget keeps a flapping leader from looping forever.
+const FULL_REPORT_MAX_ROUND_RESTARTS: u32 = 2;
+
+/// How one full report round ended.
+enum RoundOutcome {
+    /// Every batch was accepted; holds the number of reported blocks.
+    Done(usize),
+    /// The master missed earlier batches of this round and asked for it again.
+    Restart,
+}
+
+/// Run full report rounds until one is accepted.
+///
+/// A full report is accumulated by the master it is sent to. If the leader
+/// changes mid-round, the new master only receives the tail of the round and
+/// answers `restart_full_report`, because an accumulation holding only the tail
+/// can never complete. The worker then resends the whole round.
+fn run_full_report(mut round: impl FnMut() -> CommonResult<RoundOutcome>) -> CommonResult<usize> {
+    let mut restarts = 0;
+    loop {
+        match round()? {
+            RoundOutcome::Done(reported) => return Ok(reported),
+            RoundOutcome::Restart if restarts < FULL_REPORT_MAX_ROUND_RESTARTS => {
+                restarts += 1;
+                warn!(
+                    "master missed the earlier batches of the full block report, resending the round (restart {}/{})",
+                    restarts, FULL_REPORT_MAX_ROUND_RESTARTS
+                );
+            }
+            RoundOutcome::Restart => {
+                return Err(CommonError::from(FsError::common(format!(
+                    "master asked to restart the full block report {} times; giving up",
+                    restarts
+                ))));
+            }
+        }
+    }
+}
+
+/// Send every batch of one full report round, in order, under `report_id`.
+///
+/// Returns [`RoundOutcome::Restart`] as soon as a response asks for the round
+/// again, without sending the remaining batches: the master cannot complete
+/// them. `accepted` receives every response the master took, so their commands
+/// are applied even when a later batch ends the round.
+fn send_round<T>(
+    report_id: u64,
+    items: &[T],
+    batch_limit: usize,
+    mut send: impl FnMut(u64, u64, usize, &[T]) -> CommonResult<BlockReportListResponse>,
+    mut accepted: impl FnMut(BlockReportListResponse),
+) -> CommonResult<RoundOutcome> {
+    let total_len = items.len();
+    if total_len == 0 {
+        let response = send(report_id, 0, total_len, &[])?;
+        if response.restart_full_report.unwrap_or(false) {
+            return Ok(RoundOutcome::Restart);
+        }
+        accepted(response);
+        return Ok(RoundOutcome::Done(0));
+    }
+
+    let mut off = 0;
+    let mut batch_index = 0;
+    while off < total_len {
+        let end = (off + batch_limit).min(total_len);
+        let batch = &items[off..end];
+        let spend = TimeSpent::new();
+        let response = send(report_id, batch_index, total_len, batch)?;
+        if response.restart_full_report.unwrap_or(false) {
+            return Ok(RoundOutcome::Restart);
+        }
+        info!(
+            "full block report, batch={}, blocks={}, msg_bytes={}, used_ms={}",
+            batch_index,
+            batch.len(),
+            size_of_val(batch),
+            spend.used_ms()
+        );
+        accepted(response);
+        off = end;
+        batch_index += 1;
+    }
+
+    Ok(RoundOutcome::Done(total_len))
+}
+
+/// Id shared by every batch of one full report round, so the master can tell a
+/// resent batch from the start of a new round. Never 0, which means "no id".
+fn new_report_id() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    nanos.max(1)
+}
+
+/// Whether a failed full block report batch may succeed when sent again.
+///
+/// The cluster connector already retries timeouts and master switches itself.
+/// When that retry budget runs out it surfaces as `FsError::IO`, which is the
+/// case that reaches here in practice (the `Timeout` and `NotLeaderMaster`
+/// variants are kept for completeness). `FsError::IO` can also be an IO error
+/// returned by the master itself. That is how the master asks for a resend while
+/// it is still processing the completing batch of the same round; other master
+/// IO failures are retried needlessly but only a bounded number of times.
+/// Anything else is a decision made by the master, so startup should fail.
+fn is_retryable_report_error(err: &CommonError) -> bool {
+    matches!(
+        err.downcast_ref::<FsError>(),
+        Some(FsError::Timeout(_) | FsError::IO(_) | FsError::NotLeaderMaster(_))
+    )
+}
+
+/// Run one full block report RPC and resend it on transient errors.
+///
+/// The master accumulates a full report by `worker_id` and `report_id`,
+/// de-duplicates block ids and remembers the last completed `report_id`, so
+/// resending any batch of the same round is safe.
+/// Gives up early once `is_stopped` reports that the worker is shutting down.
+fn send_with_retry<T>(
+    what: &str,
+    is_stopped: impl Fn() -> bool,
+    mut sleep: impl FnMut(Duration),
+    mut send: impl FnMut() -> CommonResult<T>,
+) -> CommonResult<T> {
+    let mut attempt = 1;
+    let mut backoff = FULL_REPORT_RETRY_BASE;
+    loop {
+        let err = match send() {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+
+        if attempt >= FULL_REPORT_MAX_ATTEMPTS || !is_retryable_report_error(&err) || is_stopped() {
+            return Err(err);
+        }
+
+        warn!(
+            "{} failed (attempt {}/{}), retry in {} ms: {}",
+            what,
+            attempt,
+            FULL_REPORT_MAX_ATTEMPTS,
+            backoff.as_millis(),
+            err
+        );
+        sleep(backoff);
+        // The worker may have started shutting down while we were waiting.
+        if is_stopped() {
+            return Err(err);
+        }
+        backoff = (backoff * 2).min(FULL_REPORT_RETRY_MAX);
+        attempt += 1;
+    }
+}
+
+/// Worker block management role.
+/// 1. Register worker with master
+/// 2. Report block information to the master
+/// 3. Accept the master's instructions and delete the block data.
+#[derive(Clone)]
+pub struct BlockActor {
+    pub(crate) client: MasterClient,
+    store: BlockStore,
+    executor: Arc<GroupExecutor>,
+    heartbeat_interval_ms: u64,
+    worker_ctl: StateCtl,
+    block_report_limit: usize,
+    /// Startup checksum scan rate in bytes per second (0 is unlimited), or
+    /// None when the scan is off.
+    checksum_scan_rate: Option<u64>,
+
+    // Block that needs to be reported when the heartbeats.
+    // Includes the following situations:
+    // 1. Block file deletion report.
+    // 2. Add a new block.
+    report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+    pending_deletes: Arc<DashSet<i64>>,
+}
+
+impl BlockActor {
+    pub(crate) fn new(
+        rt: Arc<Runtime>,
+        conf: &ClusterConf,
+        store: BlockStore,
+        config: BlockActorConfig,
+    ) -> CommonResult<BlockActor> {
+        let BlockActorConfig {
+            worker_addr,
+            worker_session_id,
+            worker_ctl,
+            startup_time_ms,
+            report_blocks,
+        } = config;
+        let context = FsContext::with_rt(conf.clone(), rt.clone())?;
+        let context = Arc::new(context);
+        let client = MasterClient::new(
+            context.clone(),
+            MasterClientConfig {
+                cluster_id: store.cluster_id()?,
+                worker_id: store.worker_id()?,
+                worker_addr,
+                worker_weight: conf.worker.weight,
+                worker_session_id,
+                startup_time_ms,
+                worker_conf: conf.worker.clone(),
+            },
+        )?;
+        let executor = GroupExecutor::new(
+            "worker-block-executor",
+            conf.worker.executor_threads,
+            conf.worker.executor_channel_size,
+        );
+        let heartbeat_interval_ms = conf.master.heartbeat_interval_ms();
+        let block_report_limit = conf.master.block_report_limit;
+        let checksum_scan_rate = if conf.worker.checksum_scan_enabled() {
+            Some(conf.worker.checksum_scan_bytes_per_sec()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            client,
+            store,
+            executor: Arc::new(executor),
+            heartbeat_interval_ms,
+            worker_ctl,
+            block_report_limit,
+            report_blocks,
+            checksum_scan_rate,
+            pending_deletes: Arc::new(DashSet::new()),
+        })
+    }
+
+    pub fn start(self) -> CommonResult<()> {
+        info!("start block actor");
+
+        self.register()?;
+        info!("worker register success");
+
+        let spend = TimeSpent::new();
+        let total_len = self.full_block_report()?;
+        info!(
+            "worker block report success, total blocks {}, used {} ms",
+            total_len,
+            spend.used_ms()
+        );
+
+        Self::start_heartbeat(
+            HeartbeatTask {
+                capacity_proof: Default::default(),
+                registration: self.clone(),
+                executor: self.executor.clone(),
+                worker_ctl: self.worker_ctl.clone(),
+                client: self.client.clone(),
+                store: self.store.clone(),
+                report_blocks: self.report_blocks.clone(),
+                pending_deletes: self.pending_deletes.clone(),
+                block_report_limit: self.block_report_limit,
+            },
+            self.heartbeat_interval_ms,
+        )?;
+
+        if let Some(rate) = self.checksum_scan_rate {
+            self.start_checksum_scan(rate)?;
+        }
+        Ok(())
+    }
+
+    /// Verify the loaded blocks in the background. It starts after the full
+    /// report so the corrupted deletions it causes find master's locations.
+    fn start_checksum_scan(&self, rate: u64) -> CommonResult<()> {
+        let scan = ChecksumScan::new(self.store.clone(), rate);
+        let worker_ctl = self.worker_ctl.clone();
+        std::thread::Builder::new()
+            .name("worker-checksum-scan".to_string())
+            .spawn(move || {
+                let stopped = || worker_ctl.state::<ServerState>() == ServerState::Stop;
+                if let Err(e) = scan.run(stopped) {
+                    warn!("block checksum scan failed: {}", e);
+                }
+            })?;
+        Ok(())
+    }
+
+    // Worker registration.
+    pub fn register(&self) -> CommonResult<()> {
+        let storages_info = self.store.get_and_check_storages()?;
+        let result = self.client.heartbeat(HeartbeatStatus::Start, storages_info);
+        result?;
+        Ok(())
+    }
+
+    pub fn full_block_report(&self) -> CommonResult<usize> {
+        self.client.begin_initial_full_report();
+        let result = self.full_block_report_inner();
+        self.client.end_initial_full_report();
+        result
+    }
+
+    fn full_block_report_inner(&self) -> CommonResult<usize> {
+        run_full_report(|| self.report_full_round())
+    }
+
+    /// Send one full report round: a fresh report id, then every batch in order.
+    fn report_full_round(&self) -> CommonResult<RoundOutcome> {
+        let blocks = self.store.all_blocks()?;
+        send_round(
+            new_report_id(),
+            &blocks,
+            self.block_report_limit,
+            |report_id, batch_index, total_len, batch| {
+                self.send_full_report(report_id, batch_index, total_len, batch)
+            },
+            |response| self.apply_report_response(response),
+        )
+    }
+
+    /// Apply the commands the master returned for an accepted batch.
+    fn apply_report_response(&self, response: BlockReportListResponse) {
+        let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+        HeartbeatTask::delete_block_task(
+            self.executor.clone(),
+            self.store.clone(),
+            cmds,
+            self.report_blocks.clone(),
+            self.pending_deletes.clone(),
+        );
+    }
+
+    fn send_full_report(
+        &self,
+        report_id: u64,
+        batch_index: u64,
+        total_len: usize,
+        batch: &[BlockMeta],
+    ) -> CommonResult<BlockReportListResponse> {
+        send_with_retry(
+            "full block report",
+            || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
+            std::thread::sleep,
+            || {
+                self.client
+                    .full_block_report_batch(report_id, batch_index, total_len, batch)
+            },
+        )
+    }
+
+    pub(crate) fn start_heartbeat(
+        task: HeartbeatTask,
+        heartbeat_interval_ms: u64,
+    ) -> CommonResult<()> {
+        let scheduler = ScheduledExecutor::new("worker-heartbeat", heartbeat_interval_ms);
+        scheduler.start(task)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::io;
+
+    fn io_error() -> CommonError {
+        CommonError::from(FsError::from(io::Error::from(io::ErrorKind::TimedOut)))
+    }
+
+    fn master_error() -> CommonError {
+        CommonError::from(FsError::common("rejected by master"))
+    }
+
+    #[test]
+    fn retries_transient_error_until_success() {
+        let calls = Cell::new(0);
+        let waits = RefCell::new(vec![]);
+
+        let res = send_with_retry(
+            "test",
+            || false,
+            |d| waits.borrow_mut().push(d),
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(io_error())
+                } else {
+                    Ok(calls.get())
+                }
+            },
+        );
+
+        assert_eq!(res.unwrap(), 3);
+        assert_eq!(
+            *waits.borrow(),
+            vec![Duration::from_secs(1), Duration::from_secs(2)]
+        );
+    }
+
+    #[test]
+    fn gives_up_after_max_attempts() {
+        let calls = Cell::new(0);
+        let waits = RefCell::new(vec![]);
+
+        let res: CommonResult<()> = send_with_retry(
+            "test",
+            || false,
+            |d| waits.borrow_mut().push(d),
+            || {
+                calls.set(calls.get() + 1);
+                Err(io_error())
+            },
+        );
+
+        assert!(res.is_err());
+        assert_eq!(calls.get(), FULL_REPORT_MAX_ATTEMPTS);
+        assert_eq!(waits.borrow().len() as u32, FULL_REPORT_MAX_ATTEMPTS - 1);
+        assert!(waits.borrow().iter().all(|d| *d <= FULL_REPORT_RETRY_MAX));
+    }
+
+    #[test]
+    fn does_not_retry_permanent_error() {
+        let calls = Cell::new(0);
+
+        let res: CommonResult<()> = send_with_retry(
+            "test",
+            || false,
+            |_| panic!("must not wait for a permanent error"),
+            || {
+                calls.set(calls.get() + 1);
+                Err(master_error())
+            },
+        );
+
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn stops_retrying_when_worker_is_shutting_down() {
+        let calls = Cell::new(0);
+
+        let res: CommonResult<()> = send_with_retry(
+            "test",
+            || true,
+            |_| panic!("must not wait while shutting down"),
+            || {
+                calls.set(calls.get() + 1);
+                Err(io_error())
+            },
+        );
+
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn stops_when_worker_shuts_down_during_backoff() {
+        let calls = Cell::new(0);
+        let stopped = Cell::new(false);
+
+        let res: CommonResult<()> = send_with_retry(
+            "test",
+            || stopped.get(),
+            |_| stopped.set(true),
+            || {
+                calls.set(calls.get() + 1);
+                Err(io_error())
+            },
+        );
+
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn report_ids_are_nonzero_and_change_between_rounds() {
+        let first = new_report_id();
+        std::thread::sleep(Duration::from_millis(1));
+        let second = new_report_id();
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
+    }
+
+    fn accepted_response() -> BlockReportListResponse {
+        BlockReportListResponse {
+            cmds: vec![],
+            restart_full_report: None,
+        }
+    }
+
+    fn restart_response() -> BlockReportListResponse {
+        BlockReportListResponse {
+            cmds: vec![],
+            restart_full_report: Some(true),
+        }
+    }
+
+    #[test]
+    fn a_restart_response_replays_the_round_with_a_new_id_from_the_first_batch() {
+        let items: Vec<u32> = (0..5).collect();
+        // Every batch the worker would have sent, as (report_id, batch_index).
+        let calls: RefCell<Vec<(u64, u64)>> = RefCell::new(Vec::new());
+        let applied = Cell::new(0);
+
+        let res = run_full_report(|| {
+            // A new id per round, like `report_full_round` generates.
+            std::thread::sleep(Duration::from_millis(1));
+            send_round(
+                new_report_id(),
+                &items,
+                2,
+                |report_id, batch_index, total_len, _batch| {
+                    assert_eq!(total_len, items.len());
+                    let mut calls = calls.borrow_mut();
+                    calls.push((report_id, batch_index));
+                    // The master loses the round after it took one batch.
+                    if calls.len() == 2 {
+                        return Ok(restart_response());
+                    }
+                    Ok(accepted_response())
+                },
+                |_response| applied.set(applied.get() + 1),
+            )
+        });
+
+        assert_eq!(res.unwrap(), items.len());
+        let calls = calls.into_inner();
+        let refused_id = calls[0].0;
+        let replayed_id = calls[2].0;
+        assert_ne!(refused_id, 0);
+        assert_ne!(replayed_id, 0);
+        assert_ne!(
+            refused_id, replayed_id,
+            "a restarted round must use a new report id"
+        );
+        assert_eq!(
+            calls,
+            vec![
+                (refused_id, 0),
+                (refused_id, 1),
+                (replayed_id, 0),
+                (replayed_id, 1),
+                (replayed_id, 2),
+            ],
+            "the restarted round must replay every batch from the first one"
+        );
+        assert_eq!(applied.get(), 4, "the refused batch must not be applied");
+    }
+
+    #[test]
+    fn resends_the_round_when_the_master_missed_the_earlier_batches() {
+        let rounds = Cell::new(0);
+
+        let res = run_full_report(|| {
+            rounds.set(rounds.get() + 1);
+            if rounds.get() == 1 {
+                Ok(RoundOutcome::Restart)
+            } else {
+                Ok(RoundOutcome::Done(7))
+            }
+        });
+
+        assert_eq!(res.unwrap(), 7);
+        assert_eq!(rounds.get(), 2);
+    }
+
+    #[test]
+    fn gives_up_after_the_restart_budget() {
+        let rounds = Cell::new(0);
+
+        let res = run_full_report(|| {
+            rounds.set(rounds.get() + 1);
+            Ok(RoundOutcome::Restart)
+        });
+
+        assert!(res.is_err());
+        assert_eq!(rounds.get(), FULL_REPORT_MAX_ROUND_RESTARTS + 1);
+    }
+
+    #[test]
+    fn a_failed_round_is_not_restarted() {
+        let rounds = Cell::new(0);
+
+        let res = run_full_report(|| {
+            rounds.set(rounds.get() + 1);
+            Err(master_error())
+        });
+
+        assert!(res.is_err());
+        assert_eq!(rounds.get(), 1);
+    }
+
+    #[test]
+    fn classifies_retryable_errors() {
+        assert!(is_retryable_report_error(&io_error()));
+        assert!(is_retryable_report_error(&CommonError::from(
+            FsError::not_leader("master switched")
+        )));
+        assert!(!is_retryable_report_error(&master_error()));
+        assert!(!is_retryable_report_error(&CommonError::from("plain")));
+    }
+}

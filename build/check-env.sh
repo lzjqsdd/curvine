@@ -92,6 +92,9 @@ generate_reference_links() {
             "JDK")
                 echo -e "  - ${YELLOW}JDK${NC}: ${GREEN}https://openjdk.java.net/install/${NC}"
                 ;;
+            "NODE")
+                echo -e "  - ${YELLOW}Node.js${NC}: ${GREEN}https://nodejs.org/en/download/${NC} (CentOS 7: unofficial glibc-217 builds)"
+                ;;
             "NPM")
                 echo -e "  - ${YELLOW}npm${NC}: ${GREEN}https://nodejs.org/en/download/${NC}"
                 ;;
@@ -150,18 +153,18 @@ else
     print_status "FAIL" "Protobuf compiler (protoc) not found. Please install Protobuf version 3.0.0 or later" "PROTOBUF"
 fi
 
-# Check Maven (version 3.8 or later) - skip if --skip-java-sdk is set
+# Check Maven (version 3.9 or later) - skip if --skip-java-sdk is set
 if [ $SKIP_JAVA_SDK -eq 0 ]; then
     echo -e "${BLUE}Checking Maven...${NC}"
     if command -v mvn >/dev/null 2>&1; then
         MAVEN_VERSION=$(mvn --version | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        if version_compare "$MAVEN_VERSION" "3.8.0"; then
-            print_status "OK" "Maven $MAVEN_VERSION (>= 3.8.0 required)"
+        if version_compare "$MAVEN_VERSION" "3.9.0"; then
+            print_status "OK" "Maven $MAVEN_VERSION (>= 3.9.0 required)"
         else
-            print_status "FAIL" "Maven $MAVEN_VERSION found, but version 3.8.0 or later is required" "MAVEN"
+            print_status "FAIL" "Maven $MAVEN_VERSION found, but version 3.9.0 or later is required" "MAVEN"
         fi
     else
-        print_status "FAIL" "Maven not found. Please install Maven version 3.8.0 or later" "MAVEN"
+        print_status "FAIL" "Maven not found. Please install Maven version 3.9.0 or later" "MAVEN"
     fi
 else
     echo -e "${BLUE}Checking Maven...${NC}"
@@ -268,6 +271,19 @@ else
     print_status "OK" "JDK check skipped (--skip-java-sdk enabled)"
 fi
 
+# Check Node.js (version 22.13 or later; required for WebUI / Vite)
+echo -e "${BLUE}Checking Node.js...${NC}"
+if command -v node >/dev/null 2>&1; then
+    NODE_VERSION=$(node --version | sed 's/^v//' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+    if version_compare "$NODE_VERSION" "22.13.0"; then
+        print_status "OK" "Node.js $NODE_VERSION (>= 22.13.0 required)"
+    else
+        print_status "FAIL" "Node.js $NODE_VERSION found, but version 22.13.0 or later is required" "NODE"
+    fi
+else
+    print_status "FAIL" "Node.js not found. Please install Node.js version 22.13.0 or later" "NODE"
+fi
+
 # Check npm (version 9 or later)
 echo -e "${BLUE}Checking npm...${NC}"
 if command -v npm >/dev/null 2>&1; then
@@ -281,7 +297,7 @@ else
     print_status "FAIL" "npm not found. Please install npm version 9.0.0 or later" "NPM"
 fi
 
-# Check Python (3.6+; skip if building without Python SDK)
+# Check Python (3.8+; skip if building without Python SDK)
 if [ $SKIP_PYTHON_SDK -eq 0 ]; then
     echo -e "${BLUE}Checking Python...${NC}"
     if command -v python3 >/dev/null 2>&1; then
@@ -289,10 +305,10 @@ if [ $SKIP_PYTHON_SDK -eq 0 ]; then
         if [ -z "$PYTHON_VERSION" ]; then
             PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
         fi
-        if version_compare "$PYTHON_VERSION" "3.6.0"; then
-            print_status "OK" "Python $PYTHON_VERSION (>= 3.6.0 required)"
+        if version_compare "$PYTHON_VERSION" "3.8.0"; then
+            print_status "OK" "Python $PYTHON_VERSION (>= 3.8.0 required)"
         else
-            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.6.0 or later is required" "PYTHON"
+            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.8.0 or later is required" "PYTHON"
         fi
     elif command -v python >/dev/null 2>&1; then
         PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
@@ -300,13 +316,13 @@ if [ $SKIP_PYTHON_SDK -eq 0 ]; then
             PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
         fi
         PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
-        if [ "$PYTHON_MAJOR" = "3" ] && version_compare "$PYTHON_VERSION" "3.6.0"; then
-            print_status "OK" "Python $PYTHON_VERSION (>= 3.6.0 required)"
+        if [ "$PYTHON_MAJOR" = "3" ] && version_compare "$PYTHON_VERSION" "3.8.0"; then
+            print_status "OK" "Python $PYTHON_VERSION (>= 3.8.0 required)"
         else
-            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.6.0 or later is required" "PYTHON"
+            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.8.0 or later is required" "PYTHON"
         fi
     else
-        print_status "FAIL" "Python not found. Please install Python version 3.6.0 or later" "PYTHON"
+        print_status "FAIL" "Python not found. Please install Python version 3.8.0 or later" "PYTHON"
     fi
 else
     echo -e "${BLUE}Checking Python...${NC}"
