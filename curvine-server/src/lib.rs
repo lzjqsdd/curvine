@@ -13,6 +13,19 @@
 // limitations under the License.
 
 pub mod common;
-pub mod master;
 pub mod test;
-pub mod worker;
+pub mod transfer;
+
+pub mod metadata {
+    pub use curvine_raft as raft;
+    pub use curvine_rocksdb as rocksdb;
+}
+
+pub mod storage {
+    pub use curvine_storage_local as local;
+}
+
+pub use curvine_data_transfer as data_transfer;
+pub use curvine_master::master;
+pub use curvine_mds as mds;
+pub use curvine_worker as worker;

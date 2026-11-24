@@ -24,6 +24,10 @@ pub enum Commands {
     #[command(name = "fs")]
     Fs(FsCommand),
 
+    /// Inspect block replica health
+    #[command(name = "fsck")]
+    Fsck(FsckCommand),
+
     #[command(name = "report")]
     Report(ReportCommand),
 
@@ -31,13 +35,21 @@ pub enum Commands {
     #[command(name = "load")]
     Load(LoadCommand),
 
-    /// Query loading task status
-    #[command(name = "load-status")]
-    LoadStatus(LoadStatusCommand),
+    /// Exporting Curvine files to mounted UFS
+    #[command(name = "export")]
+    Export(ExportCommand),
 
-    /// Cancel loading task
-    #[command(name = "cancel-load")]
-    CancelLoad(CancelLoadCommand),
+    /// Query transfer task status
+    #[command(name = "transfer-status", hide = true)]
+    TransferStatus(TransferStatusCommand),
+
+    /// Cancel transfer task
+    #[command(name = "cancel-transfer", hide = true)]
+    CancelTransfer(CancelTransferCommand),
+
+    /// Manage transfer jobs
+    #[command(name = "transfer")]
+    Transfer(TransferCommand),
 
     /// mount ufs to curvine
     #[command(name = "mount")]
@@ -51,7 +63,19 @@ pub enum Commands {
     #[command(name = "node")]
     Node(NodeCommand),
 
+    /// Master metadata snapshot command
+    #[command(name = "snapshot")]
+    Snapshot(SnapshotCommand),
+
     /// show cli version
     #[command(name = "version")]
     Version,
+
+    /// Print a shell completion script for `cv` (bash, zsh, fish, powershell, elvish)
+    #[command(name = "completion")]
+    Completion {
+        /// Shell to generate the completion script for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }

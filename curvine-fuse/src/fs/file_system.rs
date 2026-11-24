@@ -17,9 +17,9 @@ use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
-use curvine_common::fs::{StateReader, StateWriter};
+use bytes::BytesMut;
+use curvine_fs_api::{StateReader, StateWriter};
 use std::future::Future;
-use tokio_util::bytes::BytesMut;
 
 pub trait FileSystem: Send + Sync + 'static {
     fn init(&self, op: Init<'_>) -> impl Future<Output = FuseResult<fuse_init_out>> + Send {
@@ -43,6 +43,10 @@ pub trait FileSystem: Send + Sync + 'static {
     }
 
     fn remove_xattr(&self, op: RemoveXAttr<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    }
+
+    fn ioctl(&self, op: Ioctl<'_>) -> impl Future<Output = FuseResult<BytesMut>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
@@ -157,6 +161,27 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
+    /// `renameat2(2)` with flags; default ENOSYS like `rename`.
+    fn rename2(&self, op: Rename2<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    }
+
+    /// `fsync(2)`/`fdatasync(2)` on a directory fd; default no-op.
+    fn fsync_dir(&self, _op: FSyncDir<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { Ok(()) }
+    }
+
+    /// The kernel's teardown signal, sent synchronously on a clean umount and
+    /// awaiting an (empty) reply. Curvine performs its real unmount cleanup
+    /// out-of-band via `FuseSession` (which calls `unmount()`), so `destroy`
+    /// only acknowledges with an empty reply and deliberately does NOT call
+    /// `unmount()` here, to avoid a double unmount.
+    fn destroy(&self, _op: Destroy<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { Ok(()) }
+    }
+
+    /// Best-effort fallback for an interrupt whose target is no longer present
+    /// in the dispatcher's pending-request map.
     fn interrupt(&self, _op: Interrupt<'_>) -> impl Future<Output = FuseResult<()>> + Send {
         async move { Ok(()) }
     }

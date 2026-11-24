@@ -13,22 +13,28 @@
 // limitations under the License.
 
 use crate::fs::operator::Read;
+use crate::fuse_metrics::{
+    mono_now, FuseMetrics, ReadQueueGuard, ReadWaitMetrics, ReadWaitTimer, IO_TYPE_READ,
+};
 use crate::session::FuseResponse;
 use curvine_client::unified::UnifiedReader;
-use curvine_common::conf::FuseConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{Path, Reader};
-use curvine_common::state::FileStatus;
-use curvine_common::FsResult;
-use log::error;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::ErrorMonitor;
+use curvine_config::FuseConf;
+use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError};
+use curvine_fs_api::{Path, Reader};
+use curvine_model::FileStatus;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::channel::{
+    AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
+};
+use curvine_runtime::sync::ErrorMonitor;
+use log::debug;
+use log::{error, warn};
 use std::sync::Arc;
 
 enum ReadTask {
-    Read(i64, usize, FuseResponse),
-    Complete(CallSender<i8>, Option<FuseResponse>),
+    Read(i64, usize, FuseResponse, Option<ReadQueueGuard>),
+    Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
 }
 
 pub struct FuseReader {
@@ -37,24 +43,43 @@ pub struct FuseReader {
     sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
     status: FileStatus,
+    read_wait_metrics: Option<Arc<ReadWaitMetrics>>,
 }
 
 impl FuseReader {
     pub fn new(conf: &FuseConf, rt: Arc<Runtime>, reader: UnifiedReader) -> Self {
+        let wait_metrics = conf
+            .metrics_enabled
+            .then(|| FuseMetrics::get().read_wait_metrics());
+        Self::new_with_wait_metrics(conf, rt, reader, wait_metrics)
+    }
+
+    fn new_with_wait_metrics(
+        conf: &FuseConf,
+        rt: Arc<Runtime>,
+        reader: UnifiedReader,
+        read_wait_metrics: Option<Arc<ReadWaitMetrics>>,
+    ) -> Self {
         let path = reader.path().clone();
         let len = reader.len();
         let err_monitor = Arc::new(ErrorMonitor::new());
         let (sender, receiver) = AsyncChannel::new(conf.stream_channel_size).split();
         let status = reader.status().clone();
+        let path_type = reader.path_type();
+        let metrics_enabled = conf.metrics_enabled;
 
         let monitor = err_monitor.clone();
         rt.spawn(async move {
-            let res = Self::read_future(reader, receiver).await;
+            let res = Self::read_future(reader, receiver, path_type, metrics_enabled).await;
             match res {
                 Ok(_) => (),
 
                 Err(e) => {
-                    error!("fuse reader error: {}", e);
+                    if matches!(e.kind(), ErrorKind::FileNotFound) {
+                        debug!("fuse reader error: {}", e);
+                    } else {
+                        error!("fuse reader error: {}", e);
+                    }
                     monitor.set_error(e);
                 }
             }
@@ -66,6 +91,7 @@ impl FuseReader {
             sender,
             err_monitor,
             status,
+            read_wait_metrics,
         }
     }
 
@@ -89,24 +115,57 @@ impl FuseReader {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
-    pub async fn read(&mut self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
-        let res = self
-            .sender
-            .send(ReadTask::Read(
-                op.arg.offset as i64,
-                op.arg.size as usize,
-                reply,
-            ))
-            .await
-            .map_err(|e| self.check_error(e.into()));
-        res
+    pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
+        Self::enqueue_read(
+            &self.sender,
+            op.arg.offset as i64,
+            op.arg.size as usize,
+            reply,
+            self.read_wait_metrics.as_deref(),
+        )
+        .await
+        .map_err(|e| self.check_error(e))
     }
 
-    pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
+    async fn enqueue_read(
+        sender: &AsyncSender<ReadTask>,
+        off: i64,
+        len: usize,
+        reply: FuseResponse,
+        metrics: Option<&ReadWaitMetrics>,
+    ) -> FsResult<()> {
+        let Some(metrics) = metrics else {
+            sender.send(ReadTask::Read(off, len, reply, None)).await?;
+            return Ok(());
+        };
+
+        if sender.is_bounded() {
+            let timer = ReadWaitTimer::start(&metrics.enqueue);
+            let reserved = sender.reserve().await;
+            timer.finish(reserved.is_ok());
+            let permit = reserved?;
+            // No suspension between creating the backlog guard and publishing the task.
+            permit.send(ReadTask::Read(
+                off,
+                len,
+                reply,
+                Some(ReadQueueGuard::new(metrics)),
+            ));
+        } else {
+            // No capacity wait on an unbounded channel; retain queue residence/depth only.
+            let task = ReadTask::Read(off, len, reply, Some(ReadQueueGuard::new(metrics)));
+            sender.send(task).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(ReadTask::Complete(rx, reply)).await?;
-            tx.receive().await?;
+            // Double `?`: unwrap the channel receive, then propagate the real
+            // backend complete result.
+            tx.receive().await??;
             Ok::<(), FsError>(())
         };
         fun.await.map_err(|e| self.check_error(e))
@@ -115,23 +174,379 @@ impl FuseReader {
     async fn read_future(
         mut reader: UnifiedReader,
         mut req_receiver: AsyncReceiver<ReadTask>,
+        path_type: &'static str,
+        metrics_enabled: bool,
     ) -> FsResult<()> {
         while let Some(task) = req_receiver.recv().await {
             match task {
-                ReadTask::Read(off, len, reply) => {
+                ReadTask::Read(off, len, reply, queue) => {
+                    if let Some(queue) = queue {
+                        queue.dequeued();
+                    }
+                    let io_start = if metrics_enabled {
+                        Some(mono_now())
+                    } else {
+                        None
+                    };
+                    let inflight = FuseMetrics::stream_io_guard(metrics_enabled, IO_TYPE_READ);
                     let data = reader.fuse_read(off, len).await;
-                    reply.send_data(data.map_err(|x| x.into())).await?;
+                    drop(inflight);
+
+                    if let Some(start) = io_start {
+                        let ok = data.is_ok();
+                        // Actual bytes read (short reads count actual); requested
+                        // size is `len` (the request-size distribution).
+                        let bytes = data
+                            .as_ref()
+                            .map(|v| v.iter().map(|s| s.len() as u64).sum())
+                            .unwrap_or(0);
+                        FuseMetrics::get().record_stream_io(
+                            IO_TYPE_READ,
+                            path_type,
+                            ok,
+                            bytes,
+                            len as u64,
+                            start.elapsed().as_micros() as u64,
+                        );
+                    }
+
+                    if let Err(e) = reply.send_data(data.map_err(|x| x.into())).await {
+                        // Losing this reply receiver must not kill the shared worker.
+                        warn!("failed to send FUSE read reply: {}", e);
+                    }
                 }
 
                 ReadTask::Complete(tx, reply) => {
+                    // Complete/release IO accounting lives at send_stream to avoid double-counting.
                     let res = reader.complete().await;
-                    if let Some(reply) = reply {
-                        reply.send_rep(res).await?;
-                    }
-                    tx.send(1)?;
+                    // Deliver the real backend result to the caller (tx) first,
+                    // then the kernel reply.
+                    crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fuse_metrics::{
+        ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, IO_TYPE_READ,
+        STAGE_STREAM_IO,
+    };
+    use crate::raw::fuse_abi::{fuse_in_header, fuse_read_in};
+    use crate::session::{FuseResponse, FuseTask};
+    use curvine_client::unified::UnifiedReader;
+    use curvine_fs_api::local::LocalReader;
+    use curvine_metrics::Metrics as m;
+    use curvine_runtime::runtime::AsyncRuntime;
+    use curvine_runtime::sync::channel::AsyncChannel;
+    use std::io::Write as _;
+
+    fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {
+        FuseMetrics::ensure_init().unwrap();
+        let (tx, mut rx) = AsyncChannel::<FuseTask>::new(16).split();
+        rt.spawn(async move { while rx.recv().await.is_some() {} });
+        let gauge = m::new_gauge(
+            format!("fr_it_active_{}", std::process::id()),
+            "test".to_string(),
+        )
+        .unwrap();
+        let labels = FuseReqLabels::new("Read", FuseReqKind::Stream, 64);
+        let ctx = FuseReqCtx {
+            labels,
+            active: Some(ActiveGuard::new(gauge)),
+        };
+        FuseResponse::new_reply(1, tx, false, Some(ctx))
+    }
+
+    fn closed_reply(unique: u64) -> FuseResponse {
+        let (tx, rx) = AsyncChannel::<FuseTask>::new(1).split();
+        drop(rx);
+        FuseResponse::new_reply(unique, tx, false, None)
+    }
+
+    fn read_op_arg(offset: u64, size: u32) -> fuse_read_in {
+        fuse_read_in {
+            fh: 0,
+            offset,
+            size,
+            read_flags: 0,
+            lock_owner: 0,
+            flags: 0,
+            padding: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_wait_bounded_backpressure_cancellation_and_dequeue() {
+        let metrics = ReadWaitMetrics::for_test();
+        let (tx, mut rx) = AsyncChannel::<ReadTask>::new(1).split();
+        FuseReader::enqueue_read(&tx, 0, 1, closed_reply(101), Some(&metrics))
+            .await
+            .unwrap();
+        assert_eq!(metrics.depth.get(), 1);
+        {
+            let blocked = FuseReader::enqueue_read(&tx, 1, 1, closed_reply(102), Some(&metrics));
+            tokio::pin!(blocked);
+            assert!(futures::poll!(&mut blocked).is_pending());
+            assert_eq!(metrics.depth.get(), 1, "capacity waiters are not queued");
+        }
+        assert_eq!(metrics.enqueue.cancelled.get_sample_count(), 1);
+        match rx.recv().await.unwrap() {
+            ReadTask::Read(0, 1, _, Some(queue)) => queue.dequeued(),
+            _ => panic!("expected only the first instrumented read"),
+        }
+        assert_eq!(metrics.depth.get(), 0);
+        assert_eq!(metrics.queue.success.get_sample_count(), 1);
+        assert!(rx.try_recv().unwrap().is_none());
+
+        FuseReader::enqueue_read(&tx, 2, 1, closed_reply(103), Some(&metrics))
+            .await
+            .unwrap();
+        let blocked = FuseReader::enqueue_read(&tx, 3, 1, closed_reply(104), Some(&metrics));
+        tokio::pin!(blocked);
+        assert!(futures::poll!(&mut blocked).is_pending());
+        drop(rx.recv().await.unwrap());
+        blocked.await.unwrap();
+        assert_eq!(metrics.depth.get(), 1);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ReadTask::Read(3, 1, _, Some(_)))
+        ));
+        assert_eq!(metrics.depth.get(), 0);
+        assert_eq!(metrics.enqueue.success.get_sample_count(), 3);
+        assert_eq!(
+            metrics.queue.success.get_sample_count(),
+            1,
+            "discard is not dequeue"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_wait_unbounded_disabled_complete_and_closed_channels() {
+        for capacity in [0, 1] {
+            let metrics = ReadWaitMetrics::for_test();
+            let (tx, mut rx) = AsyncChannel::<ReadTask>::new(capacity).split();
+            FuseReader::enqueue_read(&tx, 0, 1, closed_reply(201), Some(&metrics))
+                .await
+                .unwrap();
+            assert_eq!(metrics.depth.get(), 1);
+            match rx.recv().await.unwrap() {
+                ReadTask::Read(_, _, _, Some(queue)) => queue.dequeued(),
+                _ => panic!("enabled Read must carry its backlog guard"),
+            }
+            assert_eq!(metrics.depth.get(), 0);
+            assert_eq!(metrics.queue.success.get_sample_count(), 1);
+            assert_eq!(metrics.enqueue.success.get_sample_count(), capacity as u64);
+            FuseReader::enqueue_read(&tx, 0, 1, closed_reply(202), None)
+                .await
+                .unwrap();
+            assert!(matches!(
+                rx.recv().await,
+                Some(ReadTask::Read(_, _, _, None))
+            ));
+            let (complete, _) = CallChannel::channel();
+            tx.send(ReadTask::Complete(complete, None)).await.unwrap();
+            assert!(matches!(rx.recv().await, Some(ReadTask::Complete(_, _))));
+            assert_eq!(metrics.depth.get(), 0);
+            assert_eq!(metrics.enqueue.success.get_sample_count(), capacity as u64);
+
+            drop(rx);
+            assert!(
+                FuseReader::enqueue_read(&tx, 0, 1, closed_reply(203), Some(&metrics))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(metrics.enqueue.error.get_sample_count(), capacity as u64);
+            assert_eq!(metrics.enqueue.cancelled.get_sample_count(), 0);
+            assert_eq!(metrics.queue.success.get_sample_count(), 1);
+            assert_eq!(metrics.depth.get(), 0);
+        }
+    }
+
+    #[test]
+    fn reply_send_error_does_not_kill_reader_worker() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let path_buf = std::env::temp_dir().join(format!(
+                "fr_reply_failure_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            {
+                let mut file = std::fs::File::create(&path_buf).unwrap();
+                file.write_all(b"reader-worker-survives").unwrap();
+            }
+            let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+            let conf = FuseConf {
+                metrics_enabled: false,
+                ..Default::default()
+            };
+            let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+            let rt2 = Arc::new(AsyncRuntime::single());
+            let fuse_reader = FuseReader::new(&conf, rt2.clone(), reader);
+            std::mem::forget(rt2);
+
+            let header = fuse_in_header::default();
+            let first_arg = read_op_arg(0, 6);
+            fuse_reader
+                .read(
+                    Read {
+                        header: &header,
+                        arg: &first_arg,
+                    },
+                    closed_reply(1),
+                )
+                .await
+                .unwrap();
+
+            // Submit a normal second read. Receiving its response proves that the
+            // worker survived the first request's closed reply channel.
+            let (reply_tx, mut reply_rx) = AsyncChannel::<FuseTask>::new(1).split();
+            let second_arg = read_op_arg(7, 6);
+            fuse_reader
+                .read(
+                    Read {
+                        header: &header,
+                        arg: &second_arg,
+                    },
+                    FuseResponse::new_reply(2, reply_tx, false, None),
+                )
+                .await
+                .unwrap();
+            fuse_reader.complete(None).await.unwrap();
+
+            assert!(matches!(reply_rx.recv().await, Some(FuseTask::Reply(_))));
+            let _ = std::fs::remove_file(&path_buf);
+        });
+    }
+
+    #[test]
+    fn local_reader_task_body_observes_io_with_local_path_type() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            FuseMetrics::ensure_init().unwrap();
+            let mx = FuseMetrics::get();
+            let dur_before = mx
+                .io_duration_us
+                .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                .get_sample_count();
+            let req_before = mx
+                .io_requests_total
+                .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                .get();
+            let bytes_before = mx
+                .io_bytes_total
+                .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                .get();
+            let size_before = mx
+                .io_size_bytes
+                .with_label_values(&[IO_TYPE_READ, "local"])
+                .get_sample_count();
+            let stage_before = mx
+                .stage_duration_us
+                .with_label_values(&[STAGE_STREAM_IO, "stream", "success"])
+                .get_sample_count();
+
+            // A temp file with 4096 bytes of content to read back.
+            let path_buf = std::env::temp_dir().join(format!(
+                "fr_it_read_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            {
+                let mut f = std::fs::File::create(&path_buf).unwrap();
+                f.write_all(&vec![7u8; 4096]).unwrap();
+            }
+            let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+            let conf = FuseConf::default(); // metrics_enabled=true, unbounded channel
+            let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+            assert_eq!(reader.path_type(), "local");
+            let rt2 = Arc::new(AsyncRuntime::single());
+            let wait_metrics = ReadWaitMetrics::for_test();
+            let fuse_reader = FuseReader::new_with_wait_metrics(
+                &conf,
+                rt2.clone(),
+                reader,
+                Some(wait_metrics.clone()),
+            );
+            // Leak our Arc so this runtime is never the-last-Arc-dropped inside the
+            // outer async block (dropping a tokio runtime from an async context panics).
+            std::mem::forget(rt2);
+
+            // Request 8192 bytes; the file only has 4096 (a short read).
+            let reply = metrics_reply(&rt);
+            let header = fuse_in_header::default();
+            let arg = read_op_arg(0, 8192);
+            let op = Read {
+                header: &header,
+                arg: &arg,
+            };
+            fuse_reader.read(op, reply).await.unwrap();
+
+            // Complete is ordered after Read in the actual worker. Await its
+            // acknowledgement instead of polling process-global metrics.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fuse_reader.complete(None),
+            )
+            .await
+            .expect("reader completed")
+            .unwrap();
+            assert_eq!(
+                wait_metrics.queue.success.get_sample_count(),
+                1,
+                "production dequeue must record exactly one queue sample"
+            );
+            assert_eq!(wait_metrics.depth.get(), 0, "dequeue releases backlog");
+            assert_eq!(
+                wait_metrics.enqueue.success.get_sample_count(),
+                0,
+                "default unbounded reads do not record capacity waits"
+            );
+
+            assert_eq!(
+                mx.io_duration_us
+                    .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                    .get_sample_count(),
+                dur_before + 1,
+                "read task body observed io_duration_us{{read,local,success}} exactly once"
+            );
+            assert_eq!(
+                mx.io_requests_total
+                    .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                    .get(),
+                req_before + 1,
+                "io_requests_total{{read,local,success}} +1"
+            );
+            assert_eq!(
+                mx.io_bytes_total
+                    .with_label_values(&[IO_TYPE_READ, "local", "success"])
+                    .get(),
+                bytes_before + 4096,
+                "io_bytes_total uses ACTUAL bytes read (4096, the short read), not requested 8192"
+            );
+            assert_eq!(
+                mx.io_size_bytes
+                    .with_label_values(&[IO_TYPE_READ, "local"])
+                    .get_sample_count(),
+                size_before + 1,
+                "io_size_bytes observed once (the requested-size distribution)"
+            );
+            assert!(
+                mx.stage_duration_us
+                    .with_label_values(&[STAGE_STREAM_IO, "stream", "success"])
+                    .get_sample_count()
+                    > stage_before,
+                "read backend call also emits stage=stream_io,kind=stream"
+            );
+
+            let _ = std::fs::remove_file(&path_buf);
+        });
     }
 }

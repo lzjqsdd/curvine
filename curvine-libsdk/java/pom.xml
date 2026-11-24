@@ -23,7 +23,7 @@
     <groupId>io.curvine</groupId>
     <description>Hadoop FileSystem implementation for Curvine</description>
     <artifactId>curvine-hadoop</artifactId>
-    <version>0.2.0</version>
+    <version>0.6.1-alpha</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -31,13 +31,16 @@
         <maven.compiler.target>1.8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <java.version>1.8</java.version>
-        <test.runner.version>2.22.1</test.runner.version>
+        <test.runner.version>3.6.1</test.runner.version>
         <scala.version>2.12.18</scala.version>
         <scala.compat.version>2.12</scala.compat.version>
         <dependency.scope>compile</dependency.scope>
-        <hadoop.version>3.4.0</hadoop.version>
-        <protobuf.version>3.25.7</protobuf.version>
-        <hadoop.version>3.3.4</hadoop.version>
+        <protobuf.version>4.36.2</protobuf.version>
+        <!-- Hadoop 3.5.0 is compiled for Java 17; the SDK still ships Java 8
+             bytecode, so stay on the last Java 8 compatible line until the
+             Java baseline moves. -->
+        <hadoop.version>3.3.6</hadoop.version>
+        <shade.prefix>curvine_shaded</shade.prefix>
     </properties>
 
     <dependencies>
@@ -51,14 +54,21 @@
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
-            <version>1.7.25</version>
+            <version>2.0.20</version>
             <scope>${dependency.scope}</scope>
         </dependency>
 
         <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
-            <version>4.13.1</version>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.github.luben</groupId>
+            <artifactId>zstd-jni</artifactId>
+            <version>1.5.7-28</version>
             <scope>test</scope>
         </dependency>
 
@@ -66,13 +76,49 @@
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-common</artifactId>
             <version>${hadoop.version}</version>
-            <scope>${dependency.scope}</scope>
+            <scope>provided</scope>
         </dependency>
 
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-hdfs-client</artifactId>
             <version>${hadoop.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-cli</groupId>
+            <artifactId>commons-cli</artifactId>
+            <version>1.11.0</version>
+            <!-- CLI is used only by the excluded benchmark entry points. -->
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>2.22.0</version>
+            <scope>${dependency.scope}</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.22.0</version>
+            <scope>${dependency.scope}</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-logging</groupId>
+            <artifactId>commons-logging</artifactId>
+            <version>1.4.0</version>
+            <scope>${dependency.scope}</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-recipes</artifactId>
+            <version>4.2.0</version>
             <scope>${dependency.scope}</scope>
         </dependency>
 
@@ -100,7 +146,15 @@
         <dependency>
             <groupId>com.amazonaws</groupId>
             <artifactId>aws-java-sdk-bundle</artifactId>
-            <version>1.12.262</version>
+            <version>1.12.797</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- COSN transparent-acceleration proxy extends CosNFileSystem -->
+        <dependency>
+            <groupId>com.qcloud.cos</groupId>
+            <artifactId>hadoop-cos</artifactId>
+            <version>8.2.7</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>
@@ -125,6 +179,9 @@
         <resources>
             <resource>
                 <directory>${project.basedir}/src/main/resources</directory>
+                <excludes>
+                    <exclude>log4j.properties</exclude>
+                </excludes>
             </resource>
             <resource>
                 <!--native is not included in the code. After compiling curvine on the corresponding platform, put the libsdk package in the native directory and recompile java -->
@@ -141,11 +198,21 @@
             <extension>
                 <groupId>kr.motd.maven</groupId>
                 <artifactId>os-maven-plugin</artifactId>
-                <version>1.6.2</version>
+                <version>1.7.1</version>
             </extension>
         </extensions>
 
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.5.1</version>
+                <configuration>
+                    <excludes>
+                        <exclude>io/curvine/bench/**</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
@@ -161,7 +228,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-source-plugin</artifactId>
-                <version>3.0.1</version>
+                <version>3.4.0</version>
                 <configuration>
                     <attach>true</attach>
                     <skipSource>true</skipSource>
@@ -178,7 +245,7 @@
             <plugin>
                 <groupId>net.alchim31.maven</groupId>
                 <artifactId>scala-maven-plugin</artifactId>
-                <version>4.9.5</version>
+                <version>4.10.0</version>
                 <executions>
                     <execution>
                         <id>scala-compile</id>
@@ -231,7 +298,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.2.4</version>
+                <version>3.6.2</version>
                 <configuration>
                     <filters>
                         <filter>
@@ -240,10 +307,18 @@
                                 <exclude>META-INF/*.SF</exclude>
                                 <exclude>META-INF/*.DSA</exclude>
                                 <exclude>META-INF/*.RSA</exclude>
+                                <exclude>META-INF/versions/**</exclude>
                                 <exclude>META-INF/maven/**</exclude>
+                                <exclude>module-info.class</exclude>
+                                <exclude>log4j.properties</exclude>
+                                <exclude>javax/**</exclude>
+                                <exclude>jakarta/**</exclude>
                             </excludes>
                         </filter>
                     </filters>
+                    <transformers>
+                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                    </transformers>
                 </configuration>
                 <executions>
                     <execution>
@@ -255,10 +330,19 @@
                         <configuration>
                             <shadedArtifactAttached>true</shadedArtifactAttached>
                             <shadedClassifierName>shade</shadedClassifierName>
+                            <artifactSet>
+                                <excludes>
+                                    <exclude>org.scala-lang:scala-library</exclude>
+                                </excludes>
+                            </artifactSet>
                         </configuration>
                     </execution>
 
-                    <!-- Customer service package used in big data environment-->
+                    <!--
+                      Deployment package for Hadoop hosts such as Flink and StarRocks.
+                      Hadoop APIs and SLF4J stay host-provided. All other runtime
+                      dependencies used by cv:// are embedded and relocated.
+                    -->
                     <execution>
                         <id>client</id>
                         <phase>package</phase>
@@ -268,16 +352,51 @@
                         <configuration>
                             <shadedArtifactAttached>true</shadedArtifactAttached>
                             <shadedClassifierName>client</shadedClassifierName>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/versions/**</exclude>
+                                        <exclude>META-INF/maven/**</exclude>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>log4j.properties</exclude>
+                                        <exclude>org/slf4j/impl/**</exclude>
+                                        <exclude>org/apache/log4j/**</exclude>
+                                        <exclude>org/apache/hadoop/**</exclude>
+                                        <exclude>io/curvine/S3aProxyFileSystem.class</exclude>
+                                        <exclude>io/curvine/S3aProxyFileSystem$*</exclude>
+                                        <exclude>io/curvine/CosnProxyFileSystem.class</exclude>
+                                        <exclude>io/curvine/CosnProxyFileSystem$*</exclude>
+                                        <exclude>io/curvine/CurvineFilesystemProvider.class</exclude>
+                                        <exclude>io/curvine/CurvineFilesystemProvider$*</exclude>
+                                        <exclude>io/curvine/CurvineFallbackInputStream.class</exclude>
+                                        <exclude>io/curvine/CurvineFallbackInputStream$*</exclude>
+                                        <exclude>io/curvine/CurvineShell.class</exclude>
+                                        <exclude>scala/**</exclude>
+                                        <exclude>io/curvine/bench/**</exclude>
+                                        <exclude>javax/**</exclude>
+                                        <exclude>jakarta/**</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
                             <artifactSet>
                                 <includes>
                                     <include>com.google.protobuf:protobuf-java</include>
-                                    <include>com.google.protobuf:protobuf-java-util</include>
+                                    <include>commons-io:commons-io</include>
+                                    <include>org.apache.commons:commons-lang3</include>
                                 </includes>
                             </artifactSet>
                             <relocations>
                                 <relocation>
                                     <pattern>com.google.protobuf</pattern>
-                                    <shadedPattern>curvine_shaded.com.google.protobuf</shadedPattern>
+                                    <shadedPattern>${shade.prefix}.com.google.protobuf</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.apache.commons</pattern>
+                                    <shadedPattern>${shade.prefix}.org.apache.commons</shadedPattern>
                                 </relocation>
                             </relocations>
                         </configuration>
@@ -291,19 +410,21 @@
                 <extensions>true</extensions>
                 <configuration>
                     <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
-                    <protoSourceRoot>${project.basedir}/../../curvine-common/proto</protoSourceRoot>
+                    <protoSourceRoot>${project.basedir}/../../crates/common/curvine-proto/proto</protoSourceRoot>
                     <includes>
                         <include>common.proto</include>
                         <include>master.proto</include>
                         <include>worker.proto</include>
                         <include>mount.proto</include>
-                        <include>load.proto</include>
+                        <include>job.proto</include>
+                        <include>transfer.proto</include>
                     </includes>
                     <skip>false</skip>
                 </configuration>
                 <executions>
                     <execution>
-                        <phase>compile</phase>
+                        <!-- Run before scala/java compile (process-resources) so clean mvn test works. -->
+                        <phase>generate-sources</phase>
                         <goals>
                             <goal>compile</goal>
                         </goals>
@@ -314,7 +435,7 @@
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>
-                <version>3.2.0</version>
+                <version>3.8.0</version>
                 <executions>
                     <execution>
                         <id>add-source</id>

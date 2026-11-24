@@ -1,12 +1,26 @@
 [package]
 name = "curvine-tests"
 version = "0.1.0"
+description = "Curvine integration and regression test harness"
+repository.workspace = true
 edition = "2021"
+publish = false
+
+# This package is an opt-in test harness, not a production crate. Its normal
+# dependencies may include server/client/FUSE paths used by integration tests.
 
 [features]
 # Enable OSS-HDFS backend specific tests / code paths (Jindo-based).
 # This is used by `#[cfg(feature = "oss-hdfs")]` in integration tests.
-oss-hdfs = ["curvine-ufs/oss-hdfs"]
+oss-hdfs = ["curvine-client/oss-hdfs"]
+# Enable Tencent COSN backend specific tests / code paths (libhdfs-based).
+cosn = ["curvine-client/cosn"]
+# FoundationDB backend (via curvine-server). Off by default; enable with
+# --fdb / --features fdb to build the test harness with the libfdb_c
+# link-time dependency.
+default = []
+fault-injection = ["curvine-server/fault-injection", "curvine-fault/fault-injection"]
+fdb = ["curvine-server/fdb"]
 lancedb = [
     "dep:curvine-lancedb",
     "dep:lance-io",
@@ -17,24 +31,40 @@ lancedb = [
 ]
 
 [[test]]
+name = "cli_mutation_output_test"
+path = "tests/cli_mutation_output_test.rs"
+harness = false
+
+[[test]]
 name = "lancedb_object_store_e2e"
 path = "tests/lancedb_object_store_e2e.rs"
 required-features = ["lancedb"]
 
 [dependencies]
-orpc = { workspace = true }
-curvine-common = { workspace = true }
-curvine-server = { workspace = true }
-curvine-client = { workspace = true }
+curvine-fault = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-rpc = { workspace = true }
+curvine-net = { workspace = true }
+curvine-io = { workspace = true }
+curvine-model = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-error = { workspace = true }
+curvine-config = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-alloc = { workspace = true }
+curvine-server = { workspace = true, default-features = false }
+curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
+curvine-cli = { path = "../curvine-cli" }
 curvine-lancedb = { workspace = true, optional = true }
-curvine-ufs = { workspace = true }
+curvine-ufs-api = { workspace = true }
 tokio  = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
-lance-io = { version = "4.0.0", optional = true }
+lance-io = { version = "14.0.2", default-features = false, optional = true }
 object_store = { version = "0.12.5", optional = true }
 bytes = { workspace = true }
 once_cell = { workspace = true }

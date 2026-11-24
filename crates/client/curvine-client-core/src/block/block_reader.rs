@@ -1,0 +1,422 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
+use crate::block::block_reader_local::LocalReaderOpen;
+use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
+use crate::file::FsContext;
+use curvine_core_error::ErrorExt;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_io::DataSlice;
+use curvine_model::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
+use curvine_runtime::common::Utils;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use log::warn;
+use std::sync::Arc;
+
+enum ReaderAdapter {
+    Local(BlockReaderLocal),
+    Remote(BlockReaderRemote),
+    Hole(BlockReaderHole),
+}
+
+impl ReaderAdapter {
+    async fn read(&mut self) -> FsResult<DataSlice> {
+        match self {
+            Local(r) => r.read().await,
+            Remote(r) => r.read().await,
+            Hole(r) => r.read(),
+        }
+    }
+
+    #[allow(unused)]
+    fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
+        match self {
+            Local(r) => r.blocking_read(),
+            Remote(r) => rt.block_on(r.read()),
+            Hole(r) => r.read(),
+        }
+    }
+
+    async fn complete(&mut self) -> FsResult<()> {
+        match self {
+            Local(r) => r.complete().await,
+            Remote(r) => r.complete().await,
+            Hole(r) => r.complete(),
+        }
+    }
+
+    fn remaining(&self) -> i64 {
+        match self {
+            Local(r) => r.remaining(),
+            Remote(r) => r.remaining(),
+            Hole(r) => r.remaining(),
+        }
+    }
+
+    fn seek(&mut self, pos: i64) -> FsResult<i64> {
+        match self {
+            Local(r) => r.seek(pos),
+            Remote(r) => r.seek(pos),
+            Hole(r) => r.seek(pos),
+        }
+    }
+
+    fn set_prefetch_end(&mut self, end: i64) {
+        if let Remote(r) = self {
+            r.set_prefetch_end(end)
+        }
+    }
+
+    fn pos(&self) -> i64 {
+        match self {
+            Local(r) => r.pos(),
+            Remote(r) => r.pos(),
+            Hole(r) => r.pos(),
+        }
+    }
+
+    fn len(&self) -> i64 {
+        match self {
+            Local(r) => r.len(),
+            Remote(r) => r.len(),
+            Hole(r) => r.len(),
+        }
+    }
+
+    fn block_id(&self) -> i64 {
+        match self {
+            Local(r) => r.block_id(),
+            Remote(r) => r.block_id(),
+            Hole(r) => r.block_id(),
+        }
+    }
+
+    fn worker_address(&self) -> &WorkerAddress {
+        match self {
+            Local(r) => r.worker_address(),
+            Remote(r) => r.worker_address(),
+            Hole(r) => r.worker_address(),
+        }
+    }
+}
+
+pub struct BlockReader {
+    inner: ReaderAdapter,
+    locs: Vec<WorkerAddress>,
+    block: ExtendedBlock,
+    fs_context: Arc<FsContext>,
+}
+
+impl BlockReader {
+    pub async fn new(
+        fs_context: Arc<FsContext>,
+        located: LocatedBlock,
+        off: i64,
+    ) -> FsResult<Self> {
+        let len = located.block.len;
+
+        let locs = Self::sort_locs(
+            located.locs,
+            fs_context.conf.client.short_circuit,
+            &fs_context.client_addr,
+        )?;
+
+        // A sparse block that no worker holds yet reads as zeros. Only the
+        // initial open may substitute a hole reader: once a replica has been
+        // tried, running out of replicas is a read failure, never a hole.
+        let adapter = if locs.is_empty() && located.block.alloc_opts.is_some() {
+            Hole(BlockReaderHole::new(
+                fs_context.clone(),
+                located.block.clone(),
+                off,
+                len,
+            )?)
+        } else {
+            Self::get_reader(&locs, located.block.clone(), fs_context.clone(), off, len).await?
+        };
+
+        let reader = Self {
+            inner: adapter,
+            locs,
+            block: located.block,
+            fs_context,
+        };
+
+        Ok(reader)
+    }
+
+    // Sort the worker replicas
+    // 1. Local priority
+    // 2. Other random, sharing stress
+    fn sort_locs(
+        mut locs: Vec<WorkerAddress>,
+        short_circuit: bool,
+        local_addr: &ClientAddress,
+    ) -> FsResult<Vec<WorkerAddress>> {
+        if locs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        Utils::shuffle(&mut locs);
+        if !short_circuit {
+            return Ok(locs);
+        }
+
+        let local = locs.iter().position(|x| x.hostname == local_addr.hostname);
+        if let Some(index) = local {
+            locs.swap(0, index);
+        }
+
+        Ok(locs)
+    }
+
+    /// Open a reader on one of `locs`. It never invents a reader: with no
+    /// usable replica it returns an error.
+    async fn get_reader(
+        locs: &[WorkerAddress],
+        block: ExtendedBlock,
+        fs_context: Arc<FsContext>,
+        off: i64,
+        len: i64,
+    ) -> FsResult<ReaderAdapter> {
+        let short_circuit = fs_context.conf.client.short_circuit;
+        for loc in locs {
+            let short_circuit = short_circuit && fs_context.is_local_worker(loc);
+            let res: FsResult<ReaderAdapter> = {
+                if short_circuit {
+                    match BlockReaderLocal::open(
+                        fs_context.clone(),
+                        block.clone(),
+                        loc.clone(),
+                        off,
+                        len,
+                    )
+                    .await
+                    {
+                        Ok(LocalReaderOpen::Local(reader)) => Ok(Local(reader)),
+                        Ok(LocalReaderOpen::Remote(reader)) => Ok(Remote(reader)),
+                        Err(e) => {
+                            warn!(
+                                "fail to create local block reader for {}, falling back to remote: {}",
+                                loc, e
+                            );
+                            BlockReaderRemote::new(
+                                &fs_context,
+                                block.clone(),
+                                loc.clone(),
+                                off,
+                                len,
+                            )
+                            .await
+                            .map(Remote)
+                        }
+                    }
+                } else {
+                    BlockReaderRemote::new(&fs_context, block.clone(), loc.clone(), off, len)
+                        .await
+                        .map(Remote)
+                }
+            };
+            match res {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    warn!("fail to create block reader for {}: {}", loc, e);
+                }
+            }
+        }
+
+        Err(FsError::no_available_worker(format!(
+            "There is no available worker, locs: {:?}, failed workers: {:?}",
+            locs,
+            fs_context.get_failed_workers()
+        )))
+    }
+
+    // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
+    pub async fn read(&mut self) -> FsResult<DataSlice> {
+        if !self.has_remaining() {
+            // end of block file
+            return Ok(DataSlice::empty());
+        }
+
+        loop {
+            match self.inner.read().await {
+                Ok(v) => return Ok(v),
+
+                Err(e) => {
+                    // A hole reader has no replica to fail over to
+                    if matches!(&self.inner, Hole(_)) {
+                        return Err(e.ctx(format!(
+                            "failed to read block on {}",
+                            self.inner.worker_address()
+                        )));
+                    }
+
+                    warn!(
+                        "read data error block id {}, addr {}: {}",
+                        self.block_id(),
+                        self.inner.worker_address(),
+                        e
+                    );
+                    self.fail_over(e).await?;
+                }
+            }
+        }
+    }
+
+    /// Replace the reader that just failed with one on another replica.
+    ///
+    /// The block was located on workers, so its bytes live there. Once every
+    /// replica has failed, the original read error is returned with the block
+    /// and worker attached.
+    async fn fail_over(&mut self, err: FsError) -> FsResult<()> {
+        let failed = self.inner.worker_address().clone();
+        self.locs.retain(|x| x != &failed);
+        if self.locs.is_empty() {
+            return Err(err.ctx(format!(
+                "failed to read block {} on {}, no replica left",
+                self.block_id(),
+                failed
+            )));
+        }
+        self.inner = Self::get_reader(
+            &self.locs,
+            self.block.clone(),
+            self.fs_context.clone(),
+            self.pos(),
+            self.len(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
+        if !self.has_remaining() {
+            return Ok(DataSlice::empty()); // end of block file
+        }
+        rt.block_on(self.read())
+    }
+
+    pub async fn complete(&mut self) -> FsResult<()> {
+        if let Err(e) = self.inner.complete().await {
+            warn!("fail to complete reader: {}", e);
+        }
+        Ok(())
+    }
+
+    pub fn remaining(&self) -> i64 {
+        self.inner.remaining()
+    }
+
+    pub fn has_remaining(&self) -> bool {
+        self.remaining() > 0
+    }
+
+    pub fn seek(&mut self, pos: i64) -> FsResult<()> {
+        self.inner.seek(pos)?;
+        Ok(())
+    }
+
+    /// See [`BlockReaderRemote::set_prefetch_end`]; local and hole readers
+    /// do not prefetch.
+    pub fn set_prefetch_end(&mut self, end: i64) {
+        self.inner.set_prefetch_end(end)
+    }
+
+    pub fn pos(&self) -> i64 {
+        self.inner.pos()
+    }
+
+    pub fn len(&self) -> i64 {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn block_id(&self) -> i64 {
+        self.inner.block_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_config::ClusterConf;
+    use curvine_model::{FileAllocOpts, FileType, StorageType};
+
+    #[test]
+    fn fail_over_on_last_replica_returns_error_not_hole() {
+        let fs_context = Arc::new(FsContext::new(ClusterConf::default()).unwrap());
+        // A sparse block that a writer has been assigned to: it carries both
+        // replica locations and `alloc_opts` until the write is committed.
+        let mut block = ExtendedBlock::new(1, 4096, StorageType::Disk, FileType::File);
+        block.alloc_opts = Some(FileAllocOpts::with_truncate(4096));
+        let failed = WorkerAddress::default();
+
+        // The failing reader only needs to report the replica it was reading
+        // from; a hole reader on that address stands in for the remote one.
+        let inner = BlockReaderHole::new(fs_context.clone(), block.clone(), 0, 4096).unwrap();
+        let mut reader = BlockReader {
+            inner: Hole(inner),
+            locs: vec![failed],
+            block,
+            fs_context,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let res = rt.block_on(reader.fail_over(FsError::common("injected read failure")));
+
+        assert!(
+            res.is_err(),
+            "losing the last replica must surface the read error"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("injected read failure"), "{msg}");
+        assert!(msg.contains("no replica left"), "{msg}");
+    }
+
+    #[test]
+    fn new_without_replicas_reads_sparse_block_as_zeros() {
+        let fs_context = Arc::new(FsContext::new(ClusterConf::default()).unwrap());
+        let mut block = ExtendedBlock::new(1, 4096, StorageType::Disk, FileType::File);
+        block.alloc_opts = Some(FileAllocOpts::with_truncate(4096));
+        let located = LocatedBlock {
+            block,
+            locs: vec![],
+            has_spdk: false,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut reader = rt
+            .block_on(BlockReader::new(fs_context, located, 0))
+            .unwrap();
+        assert!(matches!(reader.inner, Hole(_)));
+
+        let mut total = 0;
+        while reader.has_remaining() {
+            let chunk = rt.block_on(reader.read()).unwrap();
+            assert!(chunk.as_slice().iter().all(|&b| b == 0));
+            total += chunk.len();
+        }
+        assert_eq!(total, 4096);
+    }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "curvine-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine client benchmarks."
+
+[dependencies]
+curvine-unified-fs = { workspace = true }
+curvine-fs-api = { workspace = true }
+futures = { workspace = true }
+curvine-core-error = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = []

@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::FuseResult;
-use orpc::err_box;
-use orpc::sys::FFIUtils;
+use curvine_core_error::err_box;
+use curvine_sys::FFIUtils;
 use std::ffi::OsStr;
 use std::mem::size_of;
 
-// fuse requests the decoder.
+// Decoder for FUSE request buffers.
 pub struct FuseDecoder<'a> {
     buf: &'a [u8],
 }
@@ -36,7 +36,6 @@ impl<'a> FuseDecoder<'a> {
         self.len() == 0
     }
 
-    // Get a structure
     pub fn get_struct<T>(&mut self) -> FuseResult<&'a T> {
         let bytes = self.get_slice(size_of::<T>())?;
         Self::parse(bytes)
@@ -66,6 +65,16 @@ impl<'a> FuseDecoder<'a> {
     pub fn get_struct_vec<T>(&mut self, count: usize) -> FuseResult<Vec<&'a T>> {
         if count == 0 {
             return Ok(vec![]);
+        }
+
+        let max_count = self.buf.len() / size_of::<T>();
+        if count > max_count {
+            return err_box!(
+                "Not enough data for {} structures: requested {}, available {}",
+                std::any::type_name::<T>(),
+                count,
+                max_count
+            );
         }
 
         let mut res = Vec::with_capacity(count);
@@ -101,12 +110,20 @@ impl<'a> FuseDecoder<'a> {
         }
         self.get_slice(size)
     }
+
+    pub fn ensure_empty(&self) -> FuseResult<()> {
+        if self.buf.is_empty() {
+            Ok(())
+        } else {
+            err_box!("Unexpected trailing request data: {} bytes", self.buf.len())
+        }
+    }
 }
 
 #[cfg(test)]
 pub mod tests {
     use crate::session::fuse_decoder::FuseDecoder;
-    use orpc::CommonResult;
+    use curvine_core_error::CommonResult;
 
     const DATA: [u8; 10] = [0x66, 0x6f, 0x6f, 0x00, 0x62, 0x61, 0x72, 0x00, 0x62, 0x61];
 
@@ -123,5 +140,14 @@ pub mod tests {
         assert_eq!(coder.len(), 2);
 
         Ok(())
+    }
+
+    #[test]
+    fn ensure_empty_rejects_remaining_bytes() {
+        let mut decoder = FuseDecoder::new(&DATA);
+        decoder.get_slice(DATA.len() - 1).unwrap();
+
+        let err = decoder.ensure_empty().unwrap_err();
+        assert!(err.to_string().contains("1 bytes"));
     }
 }

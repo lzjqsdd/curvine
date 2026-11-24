@@ -14,11 +14,16 @@
 
 use crate::cli::FuseRuntimeArgs;
 use crate::fs::CurvineFileSystem;
+use crate::fuse_metrics::FuseMetrics;
 use crate::session::FuseSession;
 use crate::web_server::WebServer;
-use orpc::common::Logger;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
+use curvine_config::FuseConf;
+use curvine_core_error::CommonResult;
+use curvine_error::FsError;
+use curvine_fs_api::{FileSystem, Path};
+use curvine_runtime::common::Logger;
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+use log::{info, warn};
 use std::sync::Arc;
 
 /// Runs the default mount command using the given CLI arguments.
@@ -29,6 +34,16 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
 
     let cluster_conf = args.get_conf()?;
     Logger::init(cluster_conf.fuse.log.clone());
+    if let Some((window, attr_timeout)) = cluster_conf.fuse.meta_cache_window_exceeds_attr_timeout()
+    {
+        warn!(
+            "fuse.meta_cache_timeout ({:?}) exceeds fuse.attr_timeout ({:?}): \
+             user-side metadata may stay stale past the kernel's own cache window",
+            window, attr_timeout
+        );
+    }
+    info!("allocator: {}", curvine_alloc::allocator_type_name());
+    info!("git version: {}", curvine_sys::version::GIT_VERSION);
     cluster_conf.print();
 
     let rt = Arc::new(AsyncRuntime::new(
@@ -40,20 +55,63 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
     let fuse_rt = rt.clone();
 
     rt.block_on(async move {
-        let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone()).unwrap();
+        let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone())?;
         let conf = fs.conf().clone();
+
+        // Client-master version handshake: report this client's component_info
+        // and cache the master's advertised version / protocol / capabilities.
+        // A master without a compatibility contract is a legacy peer and is
+        // never rejected; a failed handshake degrades to legacy assumptions
+        // instead of blocking the mount.
+        if let Err(e) = fs.fs().handshake().await {
+            warn!("client-master handshake failed: {e}; continuing with legacy assumptions");
+        }
+
+        ensure_fs_path_exists(&fs, &conf).await?;
 
         let node_state = fs.state().clone();
         let web_port = conf.web_port;
-        fuse_rt.spawn(async move {
-            if let Err(e) = WebServer::start(web_port, node_state).await {
-                log::error!("Failed to start metrics server: {}", e);
+        // Start metrics before session construction so Prometheus can observe
+        // the lifecycle counter's zero baseline during startup.
+        if conf.metrics_enabled {
+            FuseMetrics::init_session_metrics();
+        }
+        match WebServer::bind(web_port).await {
+            Ok(listener) => {
+                fuse_rt.spawn(async move {
+                    if let Err(e) = WebServer::serve(listener, node_state).await {
+                        log::error!("Failed to start metrics server: {}", e);
+                    }
+                });
             }
-        });
+            Err(e) => log::error!("Failed to start metrics server: {}", e),
+        }
 
-        let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await.unwrap();
+        let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await?;
+
         session.run().await
     })?;
 
     Ok(())
+}
+
+async fn ensure_fs_path_exists(fs: &CurvineFileSystem, conf: &FuseConf) -> CommonResult<()> {
+    let path = Path::from_str(&conf.fs_path)?;
+    if path.is_root() || !path.is_cv() {
+        return Ok(());
+    }
+
+    match fs.fs().get_status(&path).await {
+        Ok(status) if status.is_dir => Ok(()),
+        Ok(_) => Err(FsError::not_a_directory(path.full_path()).into()),
+        Err(FsError::FileNotFound(_)) => {
+            if conf.readonly {
+                return Err(FsError::read_only(path.full_path()).into());
+            }
+            fs.fs().mkdir(&path, true).await?;
+            info!("created missing FUSE fs-path {}", path.full_path());
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }

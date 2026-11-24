@@ -21,6 +21,8 @@ pub use self::test_file_system::TestFileSystem;
 mod curvine_file_system;
 pub use self::curvine_file_system::CurvineFileSystem;
 
+mod plock_wait_registry;
+
 pub mod state;
 
 pub mod operator;
@@ -30,3 +32,8 @@ pub use self::fuse_reader::FuseReader;
 
 mod fuse_writer;
 pub use self::fuse_writer::FuseWriter;
+
+pub mod dcache;
+
+mod stream_result;
+pub(crate) use self::stream_result::deliver_stream_result;

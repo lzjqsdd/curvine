@@ -16,17 +16,17 @@
 
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsWriter};
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::Path;
-use curvine_common::fs::Reader;
-use curvine_common::fs::Writer;
-use curvine_common::state::{FileAllocMode, FileAllocOpts};
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonError, CommonResult};
+use curvine_error::FsError;
+use curvine_fs_api::Path;
+use curvine_fs_api::Reader;
+use curvine_fs_api::Writer;
+use curvine_model::{FileAllocMode, FileAllocOpts};
+use curvine_runtime::common::{LocalTime, Utils};
+use curvine_runtime::runtime::RpcRuntime;
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::{LocalTime, Utils};
-use orpc::runtime::RpcRuntime;
-use orpc::{err_box, CommonError, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 // Test local short-circuit read and write
@@ -100,6 +100,71 @@ fn test_remote_file_operations_with_parallelism_and_caching() -> CommonResult<()
 
     let path = Path::from_str("/file_remote_parallel_4_cache.data")?;
     run(testing, conf, path)
+}
+
+// Pipelined remote reads: several chunk requests in flight per block read.
+#[test]
+fn test_remote_file_operations_with_pipelined_reads() -> CommonResult<()> {
+    let testing = Testing::default();
+
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.read_chunk_num = 1;
+    conf.client.read_chunk_size = 65536;
+    conf.client.read_pipeline_depth = 4;
+
+    let path = Path::from_str("/file_remote_pipelined_4.data")?;
+    run(testing, conf, path)
+}
+
+#[test]
+fn test_remote_file_operations_with_pipelined_parallel_reads() -> CommonResult<()> {
+    let testing = Testing::default();
+
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.read_chunk_num = 4;
+    conf.client.read_parallel = 4;
+    conf.client.read_chunk_size = 65536;
+    conf.client.read_pipeline_depth = 4;
+
+    let path = Path::from_str("/file_remote_pipelined_parallel_4.data")?;
+    run(testing, conf, path)
+}
+
+// A reader dropped with chunk requests still in flight must not hand its
+// connection, with those responses unread, back to the pool.
+#[test]
+fn test_pipelined_reader_dropped_mid_block() -> CommonResult<()> {
+    let testing = Testing::default();
+
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.block_size = 1024 * 1024;
+    conf.client.read_chunk_num = 1;
+    conf.client.read_chunk_size = 65536;
+    conf.client.read_pipeline_depth = 8;
+    let path = Path::from_str("/file_remote_pipelined_drop.data")?;
+
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    rt.block_on(async move {
+        let (write_len, write_ck) = write(&fs, &path).await?;
+        for _ in 0..4 {
+            let mut reader = fs.open(&path).await?;
+            let mut buf = BytesMut::zeroed(1024);
+            assert!(reader.read(&mut buf).await? > 0);
+            drop(reader);
+
+            let (read_len, read_ck) = read(&fs, &path).await?;
+            assert_eq!(write_len, read_len);
+            assert_eq!(write_ck, read_ck);
+        }
+        Ok::<(), FsError>(())
+    })
+    .unwrap();
+
+    Ok(())
 }
 
 #[test]
@@ -186,7 +251,7 @@ fn _abort() -> CommonResult<()> {
     let path = Path::from_str("/file-abort.log")?;
 
     rt.block_on(async move {
-        let before = fs.get_master_info().await?.available;
+        let before = fs.get_filesystem_info().await?.available;
         let mut writer = fs.create(&path, true).await?;
         writer.write("123".as_bytes()).await?;
         writer.flush().await?;
@@ -195,7 +260,7 @@ fn _abort() -> CommonResult<()> {
         fs.delete(&path, false).await?;
 
         tokio::time::sleep(Duration::from_secs(10)).await;
-        let after = fs.get_master_info().await?.available;
+        let after = fs.get_filesystem_info().await?.available;
 
         println!("before {}, after {}", before, after);
         assert_eq!(before, after);
@@ -664,7 +729,7 @@ async fn test_resize(
     fs: &CurvineFileSystem,
     path: &Path,
     opts: FileAllocOpts,
-) -> CommonResult<curvine_common::state::FileBlocks> {
+) -> CommonResult<curvine_model::FileBlocks> {
     let block_size = fs.conf().client.block_size;
     fs.resize(path, opts.clone()).await?;
     let file_blocks = fs.get_block_locations(path).await?;

@@ -3,20 +3,58 @@ name = "curvine-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine command-line tool."
 
 [dependencies]
-orpc = { workspace = true }
-curvine-common = { workspace = true }
-curvine-client = { workspace = true }
-curvine-ufs = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-net = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-client-core = { workspace = true }
+curvine-transfer-client = { workspace = true }
+curvine-unified-fs = { workspace = true }
+curvine-bench = { workspace = true }
+curvine-ufs-api = { workspace = true }
+curvine-config = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-model = { workspace = true }
+curvine-proto = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
-num-bigint = { workspace = true }
-bigdecimal = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false}
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false}
 comfy-table = { version = "7.2.2", default-features = false }
+mimalloc = { workspace = true, optional = true }
+
+[dev-dependencies]
+curvine-io = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+[features]
+default = []
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
+system = []
+opendal-s3 = ["curvine-unified-fs/opendal-s3"]
+opendal-oss = ["curvine-unified-fs/opendal-oss"]
+opendal-gcs = ["curvine-unified-fs/opendal-gcs"]
+opendal-azblob = ["curvine-unified-fs/opendal-azblob"]
+opendal-cos = ["curvine-unified-fs/opendal-cos"]
+opendal-hdfs = ["curvine-unified-fs/opendal-hdfs"]
+opendal-webhdfs = ["curvine-unified-fs/opendal-webhdfs"]
+opendal-hdfs-native = ["curvine-unified-fs/opendal-hdfs-native"]
+cosn = ["curvine-unified-fs/cosn"]
+oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

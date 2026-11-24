@@ -1,19 +1,17 @@
 #![cfg(feature = "spdk")]
 mod common;
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
-    BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-};
-use curvine_common::state::{ExtendedBlock, FileType, StorageType};
-use curvine_common::utils::ProtoUtils;
+use curvine_config::ClusterConf;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::RpcCode;
+use curvine_io::DataSlice::Buffer;
+use curvine_io::{NvmeTarget, SpdkConf};
+use curvine_model::ProtoUtils;
+use curvine_model::{ExtendedBlock, FileType, StorageType};
+use curvine_net::net::NetUtils;
+use curvine_proto::{BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse};
+use curvine_rpc::message::{Builder, Message, RequestStatus};
+use curvine_runtime::common::Utils;
 use curvine_server::worker::Worker;
-use orpc::common::Utils;
-use orpc::io::net::NetUtils;
-use orpc::io::{NvmeTarget, SpdkConf};
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice::Buffer;
-use orpc::CommonResult;
 use prost::bytes::BytesMut;
 use std::thread;
 const CHUNK_SIZE: i32 = 4096; // NVMe-aligned chunk size
@@ -46,6 +44,7 @@ fn start_spdk_worker() -> ClusterConf {
         hugepage_str: format!("{}MB", hugepage_mb),
         hugepage_mb,
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x2".to_string()),
+        iova_mode: common::spdk_iova_mode_for_test(),
         targets: vec![NvmeTarget {
             traddr,
             trsvcid,
@@ -75,6 +74,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         client_name: "spdk-test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
 
     let req_id = Utils::req_id();
@@ -125,6 +125,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         client_name: "spdk-test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
     let msg = Builder::new()
         .code(RpcCode::WriteBlock)

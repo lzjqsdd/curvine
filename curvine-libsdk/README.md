@@ -1,12 +1,69 @@
 # Curvine libsdk
 
-Rust **`cdylib`** with **Java (JNI)** and **Python (PyO3)**. Crate path: **`curvine-libsdk/`** at the repository workspace root.
+Rust SDK facade for Java (JNI), Python (PyO3), and Rust consumers. The public compatibility package remains **`curvine-libsdk/`**, while implementation is split into FFI-neutral core and language binding crates.
 
 | Path | Role |
 |------|------|
-| `Cargo.toml`, `pyproject.toml` | Rust + wheel metadata |
+| `Cargo.toml` | Compatibility facade and release-profile features |
+| `../crates/sdk/curvine-sdk-core/` | FFI-neutral session, filesystem, reader/writer, master, and job helpers |
+| `../crates/sdk/curvine-libsdk-java/` | Java JNI ABI and Java-specific conversion helpers |
+| `../crates/sdk/curvine-libsdk-python/` | Python PyO3 ABI and wheel metadata |
 | `java/` | Hadoop `FileSystem`, JUnit |
 | `python/` | `curvinefs`, package `curvine_libsdk` (re-exports PyO3 module `curvine_libsdk._native`), tests |
+
+---
+
+## UFS Cargo features
+
+`curvine-libsdk` forwards optional UFS backends through `curvine-sdk-core` and the selected language binding crate. Default features remain **`java-sdk` only** and build a minimal Java SDK; Python is minimal with `--no-default-features --features python-sdk`. No UFS backend is enabled unless a backend feature is requested explicitly.
+
+| Feature | Forwards to |
+|---------|-------------|
+| `java-sdk-minimal` | `java-sdk` without UFS backends |
+| `python-sdk-minimal` | `python-sdk` without UFS backends |
+| `opendal-s3` | `curvine-sdk-core/opendal-s3` and selected binding crate |
+| `opendal-oss` | `curvine-sdk-core/opendal-oss` and selected binding crate |
+| `opendal-gcs` | `curvine-sdk-core/opendal-gcs` and selected binding crate |
+| `opendal-azblob` | `curvine-sdk-core/opendal-azblob` and selected binding crate |
+| `opendal-cos` | `curvine-sdk-core/opendal-cos` and selected binding crate |
+| `opendal-webhdfs` | `curvine-sdk-core/opendal-webhdfs` and selected binding crate |
+| `opendal-hdfs` | `curvine-sdk-core/opendal-hdfs` and selected binding crate |
+| `opendal-hdfs-native` | `curvine-sdk-core/opendal-hdfs-native` and selected binding crate |
+| `cosn` | Tencent COSN via libhdfs + `hadoop-cos` (`curvine-ufs-cosn`); per-mount `cosn.*` / `fs.cosn.*` credentials |
+| `internal-oss-hdfs-jindo`, `oss-hdfs` | Explicit internal OSS-HDFS/Jindo profile; needs `JINDOSDK_HOME` |
+
+**Rust consumers**
+
+```toml
+curvine-libsdk = { path = "...", features = ["java-sdk", "oss-hdfs"] }
+# or: features = ["rust-sdk", "opendal-oss"]
+```
+
+```bash
+cargo build -p curvine-libsdk --no-default-features --features "java-sdk,oss-hdfs"
+```
+
+**Java / Python packaging (`make` / `build/build.sh`)**
+
+`--ufs` flags are passed through into SDK artifacts only when present. The broader distribution still defaults server/client UFS to `opendal-s3`, but Java/Python SDK artifacts stay minimal unless `--ufs` is provided:
+
+```bash
+# Minimal Java JNI .so
+make build ARGS='--package java'
+
+# Java JNI .so with OSS-HDFS/Jindo only
+make build ARGS='--package java --ufs oss-hdfs'
+
+# Java / Python SDK with Tencent COSN (needs libhdfs + hadoop-cos on the runtime classpath)
+make build ARGS='--package java --ufs cosn'
+
+# Python wheel with an extra OpenDAL backend
+make build ARGS='--package python --ufs opendal-oss'
+```
+
+`oss-hdfs` requires JindoSDK at build/link time (`JINDOSDK_HOME`, default `/opt/jindosdk`). Do not enable it for default public artifacts unless that native SDK is available on the build host.
+
+`cosn` links against libhdfs (`hdfs_3_1`) and expects the vendor `hadoop-cos` jar on the Hadoop classpath at runtime. Mount credentials are supplied per mount (`cosn.secretId` / `cosn.secretKey` / `cosn.region`, or the Hadoop `fs.cosn.*` equivalents); they are not limited to `core-site.xml`.
 
 ---
 
@@ -19,7 +76,7 @@ make build
 ```
 
 Runs `build/build.sh`: creates **`build/.venv-python-sdk`** (gitignored), installs **`build/requirements-python-sdk.txt`** (e.g. maturin), runs **`protoc`** into **`python/curvine_libsdk/_proto/`** (namespaced protobuf stubs), produces the wheel.  
-Needs **`python3`** with **`venv`**, and **`protoc`** (`check-env` expects Python **≥ 3.6**). Override venv dir: **`CURVINE_PYTHON_SDK_VENV`**. **maturin** is installed via **cargo** when missing from PATH.  
+Needs **`python3`** with **`venv`**, and **`protoc`** (`check-env` expects Python **≥ 3.8**). Override venv dir: **`CURVINE_PYTHON_SDK_VENV`**. **maturin** is installed via **cargo** when missing from PATH.  
 Skip Python SDK: **`make build ARGS='--skip-python-sdk'`**.
 
 **2. Artifact** — `build/dist/lib/curvine_libsdk-*-cp38-abi3-*.whl` (same dir may contain legacy `libcurvine_libsdk_python_*`).
@@ -46,7 +103,7 @@ Then (no `PYTHONPATH` needed):
 from curvinefs.curvineFileSystem import CurvineFileSystem
 ```
 
-Runtime deps (**`protobuf`**, **`fsspec`**) come from **`pyproject.toml`**.
+Runtime deps (**`protobuf`**, **`fsspec`**) come from **`crates/sdk/curvine-libsdk-python/pyproject.toml`**.
 
 **4. Smoke / integration tests** — cluster + default `etc/curvine-cluster.toml`; optional **`CURVINE_CONF_FILE`**, **`CURVINE_TEST_CV_PATH`**. Example after install:
 
@@ -58,12 +115,61 @@ python3 curvine-libsdk/python/test/curvineFileSystemTest.py
 
 ## Java SDK
 
-JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. JNI library name must match **`CurvineNative.getLibraryName()`** (see `java/native/`). Put the matching **`.so`** in **`build/dist/lib/`** next to the JAR and ensure **`java.library.path`** includes that directory (`bin/dfs` wrappers often set this).
+JDK **8**, Maven **≥ 3.9.0**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. On Linux, `CurvineNative` resolves native libraries using an ordered candidate list: the detected `<distribution><major>` name, then `linux`, `centos7`, `amzn2`, `alinux3`, and `rocky9` for the detected architecture, followed by the generic `x86` library name where applicable. Package the names produced by the native build under `java/native/` and ensure **`java.library.path`** includes the directory containing them (`bin/dfs` wrappers often set this). This fallback order lets one jar run on distributions without a dedicated native filename, provided the fallback `.so` is present. On macOS (local development only; release jars bundle Linux libraries), `build.sh` bundles the dylib as `libcurvine_libsdk_mac_<arch>_64.dylib`, so the jar from `make build` works as-is; a bare `cargo build -p curvine-libsdk` output (`libcurvine_libsdk.dylib`) is also loaded when **`java.library.path`** points at its directory (e.g. `target/release`).
+
+The canonical HDFS backend selector is `hdfs.provider=native` (or `jvm` for the JVM-backed OpenDAL HDFS provider). The legacy boolean `hdfs.native=true` remains supported when `hdfs.provider` is absent.
+
+### Transparent acceleration proxies
+
+`S3aProxyFileSystem` and `CosnProxyFileSystem` let Hive/Spark/Tez jobs read
+mounted paths through Curvine without changing table LOCATIONs - the job opts
+in via Hadoop configuration (`fs.cosn.impl` / `fs.s3a.impl` plus
+`fs.cv.proxy.*`). Per-job usage and the ZooKeeper global kill switch are
+documented in [hive-cosn-cache.md](hive-cosn-cache.md).
 
 **`cannot allocate memory in static TLS block`** (large JNI `.so` + glibc): load from a real **`build/dist/lib`** path first (`CurvineNative` scans `java.library.path` entries); if it still fails, try preloading **`LD_PRELOAD`** with the same **`libcurvine_libsdk_<os>_<arch>_64.so`**, or use a host/OS image validated for Curvine JNI.
+
+### Transfer load routing
+
+Transfer is always on. `CurvineTransferClient` provides load/export submission, status,
+cancellation, retry, and wait operations; configure the reachable Transfer service addresses
+when the cluster runs a standalone Transfer service:
+
+```java
+Configuration conf = new Configuration();
+conf.set("fs.cv.master_addrs", "master-0:8995,master-1:8995");
+// Empty = the master's embedded Transfer service; set the endpoints for a
+// standalone Transfer deployment.
+conf.set("fs.cv.transfer.endpoints", "transfer-0:9010,transfer-1:9010");
+
+try (CurvineTransferClient client = CurvineTransferClient.from(conf)) {
+    SubmitTransferResponse job = client.submitLoad(
+            "s3://bucket/model/v1", "/bucket/model/v1", true);
+    GetTransferStatusResponse status = client.getTransferStatus(job.getJobId());
+    SubmitTransferResponse export = client.submitExport("/bucket/model/v1");
+}
+```
+
+The client returns the transfer protocol messages directly: `submitLoad`/`submitExport` yield a
+`SubmitTransferResponse` (`job_id`, `run_id`, `state`) and `getTransferStatus` yields a
+`GetTransferStatusResponse`. `cancelTransfer`, `retryTransfer`, and `waitTransferComplete` cover
+the rest of the lifecycle; CLI `cv load --force` is `submitLoad` followed by `retryTransfer` when
+the returned state is terminal. There is no separate load-job backend and no legacy job DTO to
+convert.
+
+Export targets are derived from the existing mount mapping and are always overwritten; export
+source paths must be Curvine paths. The three shorter `submitLoad` overloads leave the replica
+count unset: a load then uses the mount replica setting, falling back to the transfer service
+default. `submitLoad(sourcePath, targetPath, overwrite, replicas)` forces a count, and a
+non-positive `replicas` value means "use the default" there too.
+
+`fs.cv.transfer.endpoints` is a comma-separated list and is independent from Master addresses.
+It must point to the externally reachable Transfer service endpoint; the client does not infer it
+from Master nodes. Leave it empty to use the master's embedded Transfer service, which is the
+default deployment.
 
 ---
 
 ## Local dev (without `make`)
 
-From **`curvine-libsdk/`**: own venv, **`pip install maturin`**, **`maturin develop --release`**, then **`protoc`** into **`python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=python`**.
+From **`crates/sdk/curvine-libsdk-python/`**: own venv, **`pip install maturin`**, **`maturin develop --release --no-default-features --features extension-module`**, then run **`protoc`** into **`../../../curvine-libsdk/python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=../../../curvine-libsdk/python`**.

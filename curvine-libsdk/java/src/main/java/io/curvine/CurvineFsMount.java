@@ -15,16 +15,19 @@
 package io.curvine;
 
 import java.io.IOException;
+import java.util.Objects;
 import java.util.Optional;
 
 import io.curvine.exception.CurvineException;
+import io.curvine.proto.FreeResponse;
 
 public class CurvineFsMount {
-    private final long nativeHandle;
+    private final NativeFilesystemHandle filesystem;
 
     public static long SUCCESS = 0;
 
     public CurvineFsMount(FilesystemConf conf) throws IOException {
+        long nativeHandle;
         try {
             nativeHandle = CurvineNative.newFilesystem(conf.toToml());
         } catch (Exception e) {
@@ -32,6 +35,7 @@ public class CurvineFsMount {
         }
 
         checkError(nativeHandle, "Curvine fs mount error, new curvine client failed, conf: " + conf);
+        filesystem = new NativeFilesystemHandle(nativeHandle);
     }
 
     public void checkError(long errno, String msg) throws IOException {
@@ -53,15 +57,19 @@ public class CurvineFsMount {
     }
 
     public long create(String path, boolean overwrite) throws IOException {
-        long handle = CurvineNative.create(nativeHandle, path, overwrite);
-        checkError(handle);
-        return handle;
+        return filesystem.withOpen(nativeHandle -> {
+            long handle = CurvineNative.create(nativeHandle, path, overwrite);
+            checkError(handle);
+            return handle;
+        });
     }
 
     public long append(String path, long[] tmp) throws IOException {
-        long handle = CurvineNative.append(nativeHandle, path, tmp);
-        checkError(handle);
-        return handle;
+        return filesystem.withOpen(nativeHandle -> {
+            long handle = CurvineNative.append(nativeHandle, path, tmp);
+            checkError(handle);
+            return handle;
+        });
     }
 
     public void allocChunk(long writerHandle, long[] tmp) throws IOException {
@@ -81,9 +89,11 @@ public class CurvineFsMount {
     }
 
     public long open(String path, long[] tmp) throws IOException {
-        long handle = CurvineNative.open(nativeHandle, path, tmp);
-        checkError(handle);
-        return handle;
+        return filesystem.withOpen(nativeHandle -> {
+            long handle = CurvineNative.open(nativeHandle, path, tmp);
+            checkError(handle);
+            return handle;
+        });
     }
 
     public void read(long nativeHandle, long[] tmp) throws IOException {
@@ -101,47 +111,113 @@ public class CurvineFsMount {
     }
 
     public void close() throws IOException {
-        checkError(CurvineNative.closeFilesystem(nativeHandle));
+        filesystem.close("close CurvineFsMount failed");
     }
 
-    public void mkdir(String path,  boolean createParent) throws IOException {
-        checkError(CurvineNative.mkdir(nativeHandle, path, createParent));
+    /**
+     * Creates a directory.
+     *
+     * @return {@code false} when the native mkdir answered "already exists" instead of creating
+     *     or confirming a directory ({@code UnifiedFileSystem::mkdir} turns {@code FileAlreadyExists}
+     *     into {@code Ok(false)}); {@code true} otherwise
+     */
+    public boolean mkdir(String path, boolean createParent) throws IOException {
+        return filesystem.withOpen(nativeHandle -> {
+            long res = CurvineNative.mkdir(nativeHandle, path, createParent);
+            checkError(res);
+            return res == SUCCESS;
+        });
     }
 
     public byte[] getFileStatus(String path) throws IOException {
-        byte[] bytes = CurvineNative.getFileStatus(nativeHandle, path);
-        checkError(bytes);
-        return bytes;
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] bytes = CurvineNative.getFileStatus(nativeHandle, path);
+            checkError(bytes);
+            return bytes;
+        });
+    }
+
+    public byte[] setAttr(String path, SetAttrOpts opts) throws IOException {
+        Objects.requireNonNull(opts, "opts");
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] bytes = CurvineNative.setAttr(nativeHandle, path, opts.toByteArray());
+            checkError(bytes);
+            return bytes;
+        });
     }
 
     public byte[] listStatus(String path) throws IOException {
-        byte[] bytes = CurvineNative.listStatus(nativeHandle, path);
-        checkError(bytes);
-        return bytes;
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] bytes = CurvineNative.listStatus(nativeHandle, path);
+            checkError(bytes);
+            return bytes;
+        });
     }
 
     public void rename(String src, String dst) throws IOException {
-        checkError(CurvineNative.rename(nativeHandle, src, dst));
+        filesystem.withOpen(nativeHandle -> {
+            checkError(CurvineNative.rename(nativeHandle, src, dst));
+            return null;
+        });
     }
 
     public void delete(String path, boolean recursive) throws IOException {
-        checkError(CurvineNative.delete(nativeHandle, path, recursive));
+        filesystem.withOpen(nativeHandle -> {
+            checkError(CurvineNative.delete(nativeHandle, path, recursive));
+            return null;
+        });
     }
 
+    /**
+     * Delete a path through the master's async lane: the namespace effect is immediate and the
+     * blocks are reclaimed by the master's background purger.
+     */
+    public void deleteAsync(String path, boolean recursive) throws IOException {
+        filesystem.withOpen(nativeHandle -> {
+            checkError(CurvineNative.deleteAsync(nativeHandle, path, recursive));
+            return null;
+        });
+    }
+
+    /** Release Curvine metadata and blocks for a path and return the released totals. */
+    public FreeResult free(String path, boolean recursive) throws IOException {
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] bytes = CurvineNative.free(nativeHandle, path, recursive);
+            checkError(bytes);
+            return FreeResult.fromProto(FreeResponse.parseFrom(bytes).getRes());
+        });
+    }
+
+    public byte[] getFilesystemInfo() throws IOException {
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] bytes = CurvineNative.getFilesystemInfo(nativeHandle);
+            checkError(bytes);
+            return bytes;
+        });
+    }
+
+    /**
+     * @deprecated renamed to {@link #getFilesystemInfo()}; this RPC returns
+     * whole-filesystem statistics, not master-process information. Kept for
+     * source compatibility and will be removed in a future release.
+     */
+    @Deprecated
     public byte[] getMasterInfo() throws IOException {
-        byte[] bytes = CurvineNative.getMasterInfo(nativeHandle);
-        checkError(bytes);
-        return bytes;
+        return getFilesystemInfo();
     }
 
     public byte[] getMountInfo(String path) throws IOException {
-        byte[] bytes = CurvineNative.getMountInfo(nativeHandle, path);
-        checkError(bytes);
-        return bytes;
+        return filesystem.withOpen(nativeHandle -> {
+            byte[] bytes = CurvineNative.getMountInfo(nativeHandle, path);
+            checkError(bytes);
+            return bytes;
+        });
     }
 
     public Optional<String> togglePath(String path, boolean checkCache) throws IOException {
-        String ufsPath = CurvineNative.togglePath(nativeHandle, path, checkCache);
-        return Optional.ofNullable(ufsPath);
+        return filesystem.withOpen(nativeHandle -> {
+            String ufsPath = CurvineNative.togglePath(nativeHandle, path, checkCache);
+            return Optional.ofNullable(ufsPath);
+        });
     }
 }

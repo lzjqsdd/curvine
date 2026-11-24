@@ -1,0 +1,530 @@
+syntax="proto2";
+package proto;
+
+option java_package = "io.curvine.proto";
+option java_multiple_files = true;
+option java_outer_classname = "MasterProto";
+
+import "common.proto";
+
+message MkdirOptsProto {
+    required bool create_parent = 1;
+    required uint32 mode = 2;
+    map<string, bytes> x_attr = 3;
+    required StoragePolicyProto storage_policy = 4;
+    required string owner = 5;
+    required string group = 6;
+}
+
+// File system, master related requests
+// Create a directory request.
+message MkdirRequest {
+    required string path = 1;
+    required MkdirOptsProto opts = 2;
+}
+
+message MkdirResponse {
+    required bool flag = 1;
+    required FileStatusProto status = 2;
+}
+
+message CreateFileOptsProto {
+    required int32 create_flag = 1 [default = 1];
+    required bool create_parent = 2;
+
+    required FileTypeProto file_type = 3 [default = FILE_TYPE_PROTO_FILE];
+    required int32 replicas = 4 [default = 1];
+    required int64 block_size = 5 [default = 134217728];
+    map<string, bytes> x_attr = 6;
+    required StoragePolicyProto storage_policy = 7;
+    required string client_name = 8 [default = "localhost"];
+    required uint32 mode = 9;
+    required string owner = 10;
+    required string group = 11;
+    required bool sync_ufs_meta = 12 [default = false];
+    required int64 ufs_len = 13 [default = 0];
+}
+
+// Create a file.
+message CreateFileRequest {
+    required string path = 1;
+    required CreateFileOptsProto opts = 2;
+    required uint32 flags = 3;
+    // When set, the master also allocates the first block of an empty file and
+    // returns it in `first_block`, saving the separate AddBlock round trip.
+    // Masters that predate this field ignore it and clients fall back to AddBlock.
+    optional ClientAddressProto first_block_client = 4;
+}
+
+message CreateFileResponse {
+    required FileStatusProto file_status = 1;
+    optional LocatedBlockProto first_block = 2;
+}
+
+message CreateFilesBatchRequest {
+    repeated CreateFileRequest requests = 1;
+}
+
+message CreateFilesBatchResponse {
+    repeated FileStatusProto file_statuses = 1;
+}
+
+message CompleteFilesBatchRequest {
+    repeated CompleteFileRequest requests = 1;
+}
+
+message CompleteFilesBatchResponse {
+    repeated bool results = 1;
+}
+
+message OpenFileRequest {
+    required string path = 1;
+    required CreateFileOptsProto opts = 2;
+    required uint32 flags = 3;
+    // Same as CreateFileRequest.first_block_client. Only honoured when the open
+    // leaves the file empty (O_CREAT on a missing file, or O_TRUNC).
+    optional ClientAddressProto first_block_client = 4;
+}
+
+message OpenFileResponse {
+    required FileBlocksProto file_blocks = 1;
+    optional LocatedBlockProto first_block = 2;
+}
+
+
+// Delete directories or files.
+message DeleteRequest {
+    required string path = 1;
+    required bool recursive = 2;
+    // Permanently delete instead of moving the entry into /.Trash. Clients also
+    // set it for cache entries whose UFS object is already gone, covering the
+    // window where a mount is unregistered between the UFS and CV deletes.
+    optional bool skip_trash = 3 [default = false];
+    // Stage the entry under /.Trash/.pending and let the master reclaim it in
+    // the background instead of walking the subtree before replying. Combined
+    // with skip_trash the request stays permanent and synchronous.
+    optional bool async_delete = 4 [default = false];
+}
+
+message DeleteResponse {
+    optional FreeResultProto res = 1;
+    // True when the master moved the entry into /.Trash instead of purging it.
+    optional bool trashed = 2 [default = false];
+    // True when part or all of the entry is left for asynchronous reclamation,
+    // and the remaining space is freed after the purge runs. The returned
+    // counts are zero for an async delete, and cover only what was already
+    // reclaimed when a staged recursive delete stopped early.
+    optional bool purge_pending = 3 [default = false];
+}
+
+message FreeRequest {
+    required string path = 1;
+    required bool recursive = 2;
+}
+
+message FreeResponse {
+    required FreeResultProto res = 1;
+}
+
+// Recycle bin.
+message TrashEntryProto {
+    // Path of the entry inside /.Trash.
+    required string path = 1;
+    // Original absolute path recorded when the entry was deleted.
+    required string origin = 2;
+    // Deletion time in milliseconds.
+    required int64 delete_ms = 3;
+    required FileStatusProto status = 4;
+}
+
+message ListTrashRequest {
+    // Continuation token from a previous ListTrashResponse.
+    optional string page_token = 1;
+    // Requested entries per page. The server may return fewer to stay within
+    // the response byte budget, and clamps values outside [100, 10000].
+    optional uint32 page_size = 2 [default = 1000];
+}
+
+message ListTrashResponse {
+    repeated TrashEntryProto entries = 1;
+    // Token for the next page; absent when the listing is complete.
+    optional string next_page_token = 2;
+}
+
+message RestoreTrashRequest {
+    // Trash entry path (direct child of /.Trash).
+    required string path = 1;
+    // Restore destination; defaults to the recorded origin.
+    optional string dst = 2;
+    optional bool overwrite = 3 [default = false];
+}
+
+message RestoreTrashResponse {
+    // Effective destination (the recorded origin when the request omitted
+    // dst). Absent only when a retried request is answered from the retry
+    // cache, because the successful original attempt already moved the entry.
+    optional string dst = 1;
+    // Status of the restored entry, matching the entry shape in
+    // ListTrashResponse. Absent on retry-cache hits.
+    optional FileStatusProto status = 2;
+}
+
+// Empty the recycle bin in one call. This is not a convenience wrapper over
+// list + delete: only the master can return a partial DeleteResult and release
+// the blocks of entries it already purged when a later entry fails.
+message EmptyTrashRequest {
+    // Block until the entries are reclaimed and return the real counts. When
+    // false, the entries are staged for the background purger and the response
+    // only reports how many were accepted. Defaults to true so a client that
+    // predates this field keeps the blocking contract during rolling upgrades.
+    optional bool wait = 1 [default = true];
+}
+
+message EmptyTrashResponse {
+    required FreeResultProto res = 1;
+    // Entries accepted for asynchronous reclamation. Zero in wait mode, where
+    // `res` carries the reclaimed counts instead.
+    optional uint64 accepted = 2 [default = 0];
+}
+
+message GetFileStatusRequest {
+    required string path = 1;
+    optional int64 inode_id = 2;
+}
+
+message GetFileStatusResponse {
+    required FileStatusProto status = 1;
+}
+
+message ExistsRequest {
+    required string path = 1;
+}
+
+message ExistsResponse {
+    required bool exists = 1;
+}
+
+// Get the list.
+message ListStatusRequest {
+    required string path = 1;
+    required bool need_location = 2;
+}
+
+message ListStatusResponse {
+    repeated FileStatusProto statuses = 1;
+}
+
+// Rename.
+message RenameRequest {
+    required string src = 1;
+    required string dst = 2;
+    required uint32 flags = 3;
+}
+
+message RenameResponse {
+    required bool result = 1;
+}
+
+// Apply for allocation of blocks.
+message AddBlockRequest {
+    required string path = 1;
+    repeated CommitBlockProto commit_blocks = 2;
+    repeated uint32 exclude_workers = 3;
+    required bool located = 4 [default = true];
+    required ClientAddressProto client_address = 5;
+    required int64 file_len = 6;
+    optional ExtendedBlockProto last_block = 7;
+    optional int64 inode_id = 8;
+}
+
+message AddBlockResponse {
+    required LocatedBlockProto block = 1;
+}
+
+// apply for allocation of blocks batch
+message AddBlocksBatchRequest {
+    repeated AddBlockRequest requests = 1;
+}
+
+message AddBlocksBatchResponse {
+    repeated LocatedBlockProto blocks = 1;
+}
+
+message RequestReplacementWorkerRequest {
+    required int64 block_id = 1;
+    repeated uint32 exclude_workers = 2;
+}
+
+message RequestReplacementWorkerResponse {
+    required WorkerAddressProto worker = 1;
+}
+
+message ReportUnderReplicatedBlocksRequest {
+    repeated int64 block_ids = 1;
+}
+
+message ReportUnderReplicatedBlocksResponse {
+    required bool success = 1;
+    optional string message = 2;
+}
+
+// File writing is completed.
+message CompleteFileRequest {
+    required string path = 1;
+    required int64 len = 2;
+    required string client_name = 3;
+    repeated CommitBlockProto commit_blocks = 4;
+    required bool only_flush = 5 [default = false];
+    optional int64 inode_id = 6;
+    optional SetAttrOptsProto set_attr_opts = 7;
+    // Omitted by legacy clients to preserve the historical full snapshot response.
+    optional bool return_file_blocks = 8 [default = true];
+    // A block pre-allocated by CreateFile/OpenFile that the client never wrote.
+    // The master drops it if it is still empty and uncommitted.
+    optional int64 release_block_id = 9;
+}
+
+message CompleteFileResponse {
+    required bool result = 1;
+    optional FileBlocksProto file_blocks = 2;
+}
+
+// Get the block of the file.
+message GetBlockLocationsRequest {
+    required string path = 1;
+}
+
+message GetBlockLocationsResponse {
+    required FileBlocksProto blocks = 1;
+}
+
+// Diagnostic block placements retain actual storage types and unavailable replicas.
+enum WorkerStatusProto {
+    WORKER_STATUS_UNKNOWN = 0;
+    WORKER_STATUS_LIVE = 1;
+    WORKER_STATUS_BLACKLIST = 2;
+    WORKER_STATUS_DECOMMISSION = 3;
+    WORKER_STATUS_LOST = 4;
+}
+
+message BlockReplicaDetailProto {
+    required uint32 worker_id = 1;
+    required StorageTypeProto storage_type = 2;
+    optional WorkerAddressProto address = 3;
+    optional WorkerStatusProto state = 4 [default = WORKER_STATUS_UNKNOWN];
+}
+
+message FileBlockDetailProto {
+    required int64 block_id = 1;
+    required int64 block_size = 2;
+    required int64 offset = 3;
+    repeated BlockReplicaDetailProto replicas = 4;
+}
+
+message GetFileBlockDetailsRequest {
+    required string path = 1;
+}
+
+message GetFileBlockDetailsResponse {
+    required FileStatusProto status = 1;
+    repeated FileBlockDetailProto blocks = 2;
+}
+
+// Request filesystem-wide information (statfs backend).
+message GetFilesystemInfoRequest {
+    // Structured version of the requesting client (handshake). Cross-cutting
+    // protocol metadata on the reserved 1000+ range; legacy clients omit it.
+    optional ComponentInfoProto component_info = 1000;
+}
+
+message GetFilesystemInfoResponse {
+    required string active_master = 1;
+    repeated string journal_nodes = 2;
+
+    required int64 inode_dir_num = 3;
+    required int64 inode_file_num = 4;
+    required int64 block_num = 5;
+    required int64 capacity = 6;
+    required int64 available = 7;
+    required int64 fs_used = 8;
+    required int64 non_fs_used = 9;
+    required int64 reserved_bytes = 10 [default = 0];
+
+    repeated WorkerInfoProto live_workers = 11;
+    repeated WorkerInfoProto blacklist_workers = 12;
+    repeated WorkerInfoProto decommission_workers = 13;
+    repeated WorkerInfoProto lost_workers = 14;
+
+    // Capacity/available eligible for new writes (Live workers only). Absent
+    // on legacy masters; clients fall back to `capacity`/`available`.
+    optional int64 allocatable_capacity = 15 [default = 0];
+    optional int64 allocatable_available = 16 [default = 0];
+
+    // Default compatibility contract offered by this master (handshake).
+    // Cross-cutting protocol metadata on the reserved 1000+ range; legacy
+    // masters omit it and clients treat the absence as a legacy peer.
+    optional ServerCompatibilityInfoProto compatibility = 1000;
+}
+
+message SetAttrOptsProto {
+    required bool recursive = 1;
+    optional int32 replicas = 2;
+    optional string owner = 3;
+    optional string group = 4;
+    optional uint32 mode = 5;
+    optional int64 atime = 6;  // Access time in milliseconds
+    optional int64 mtime = 7;  // Modification time in milliseconds
+    optional int64 ttl_ms = 8;
+    optional TtlActionProto ttl_action = 9;
+    map<string, bytes> add_x_attr = 10;
+    repeated string remove_x_attr = 11;
+    optional int64 ufs_mtime = 12;
+}
+
+message SetAttrRequest {
+    required string path = 1;
+    required SetAttrOptsProto opts = 2;
+}
+
+message SetAttrResponse {
+    required FileStatusProto status = 1;
+}
+
+message SymlinkRequest {
+    required string target = 1;
+    required string link = 2;
+    required bool force = 3;
+    required uint32 mode = 4;
+    optional string owner = 5;
+    optional string group = 6;
+}
+
+message SymlinkResponse {
+}
+
+message LinkRequest {
+    required string src_path = 1;
+    required string dst_path = 2;
+}
+
+message LinkResponse {
+}
+
+enum MetricTypeProto {
+    GAUGE = 1;
+    COUNTER = 2;
+}
+
+message MetricValueProto {
+    required MetricTypeProto metric_type = 1;
+    required string name = 2;
+    required double value = 3;
+    map<string, string> tags = 4;
+}
+
+message MetricsReportRequest {
+    required string instance = 1;
+    required string source = 2;
+    repeated MetricValueProto metrics = 3;
+}
+
+message MetricsReportResponse {
+
+}
+
+// Client session lease heartbeat. The first heartbeat registers the session
+// keyed by client.client_name; later heartbeats renew it. Sessions are advisory
+// liveness only and are not an authentication boundary.
+message ClientHeartbeatRequest {
+    required ClientAddressProto client = 1;
+    // Client-side heartbeat interval, informational for the master.
+    required uint64 heartbeat_interval_ms = 2;
+    optional uint32 pid = 3;
+    optional string mount_point = 4;
+    optional string client_version = 5;
+}
+
+message ClientHeartbeatResponse {
+    // A session not renewed within this window is considered expired.
+    required uint64 session_timeout_ms = 1;
+    // True when this heartbeat registered a new session on the current leader.
+    required bool new_session = 2;
+}
+
+message FileResizeRequest {
+    required string path = 1;
+    required FileAllocOptsProto opts = 2;
+    optional int64 inode_id = 3;
+}
+
+message FileResizeResponse {
+    required FileBlocksProto file_blocks = 1;
+}
+
+message AssignWorkerRequest {
+    required string path = 1;
+    required ExtendedBlockProto block = 2;
+    repeated uint32 exclude_workers = 3;
+    required ClientAddressProto client_address = 4;
+    optional int64 inode_id = 5;
+}
+
+message AssignWorkerResponse {
+    required LocatedBlockProto block = 1;
+}
+
+// GetLock request
+message GetLockRequest {
+    required string path = 1;
+    required FileLockProto lock = 2;
+}
+
+// GetLock response
+message GetLockResponse {
+    optional FileLockProto conflict = 1;
+}
+
+// SetLock request
+message SetLockRequest {
+    required string path = 1;
+    required FileLockProto lock = 2;
+}
+
+// SetLock response
+message SetLockResponse {
+    optional FileLockProto conflict = 1;
+}
+
+message ListOptionsRequest {
+    required string path = 1;
+    required ListOptionsProto options = 2;
+}
+
+message ListOptionsResponse {
+    repeated FileStatusProto statuses = 1;
+}
+message CvMetadataSnapshotEntryProto {
+    required FileStatusProto status = 1;
+    optional FileBlocksProto blocks = 2;
+}
+
+message GetCvMetadataSnapshotPageRequest {
+    optional string page_token = 1;
+    optional uint32 page_size = 2 [default = 10000];
+}
+
+message GetCvMetadataSnapshotPageResponse {
+    repeated CvMetadataSnapshotEntryProto entries = 1;
+    optional string next_page_token = 2;
+    required uint64 epoch = 3;
+}
+
+message CreateLeaderSnapshotRequest {
+    // Create the checkpoint even if the previous one is inside snapshot_min_interval.
+    required bool force = 1;
+}
+
+message CreateLeaderSnapshotResponse {
+    required string dir = 1;
+    required uint64 cost_ms = 2;
+}
