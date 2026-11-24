@@ -44,31 +44,19 @@ pub mod bdi;
 use crate::fuse_metrics::{ActiveGuard, FuseReqLabels, FuseReqStatus};
 
 pub(crate) enum FuseTask {
-    /// A reply to a real FUSE request with metrics enabled. Owns the move-only
-    /// `ActiveGuard`; the sender finishes the request metrics and drops the
-    /// guard after the kernel-fd write (the E2E finish point).
     RequestReply {
         data: ResponseData,
         labels: FuseReqLabels,
         active: ActiveGuard,
         status: FuseReqStatus,
         errno: i32,
-        /// Source tag for `status == Unsupported`, carried so the sender can emit
-        /// `unsupported_total{reason}` without reaching back into the metrics
-        /// slot. Phase 1a-2 emits `unknown_opcode` / `unimplemented_opcode`;
-        /// `trait_default` is reserved for a later phase (no source site yet).
-        /// `None` for non-unsupported replies.
         unsupported_reason: Option<&'static str>,
+        queue_guard: Option<ActiveGuard>,
     },
-    /// A kernel notification (cache invalidation). No originating request, so no
-    /// labels/guard; carries its own `FuseNotifyCode::as_str()` code for
-    /// sender-side attribution.
     NotifyReply {
         data: ResponseData,
         code: &'static str,
+        queue_guard: Option<ActiveGuard>,
     },
-    /// Legacy fast path, used when metrics are disabled: no context, no guard,
-    /// the sender does no request-finish work. Keeps `metrics_enabled=false`
-    /// byte-identical to the pre-metrics behaviour.
     Reply(ResponseData),
 }

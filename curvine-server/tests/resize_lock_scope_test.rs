@@ -1,9 +1,10 @@
-use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
-use curvine_common::state::{ClientAddress, FileAllocOpts, WorkerInfo};
+use curvine_config::{ClusterConf, MasterConf};
+use curvine_model::{ClientAddress, FileAllocOpts, WorkerInfo};
+use curvine_raft::conf::JournalConf;
+use curvine_runtime::common::Utils;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::Master;
-use orpc::common::Utils;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -43,7 +44,7 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
         ip_addr: "127.0.0.1".into(),
         port: 0,
     };
-    fs.add_block("/resize/file.log", client, vec![], vec![], 0, None)
+    fs.add_block("/resize/file.log", None, client, vec![], vec![], 0, None)
         .unwrap();
 
     let fs = Arc::new(fs);

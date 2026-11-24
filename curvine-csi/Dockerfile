@@ -2,13 +2,22 @@
 FROM ghcr.io/curvineio/curvine-compile:ubuntu24.04 AS builder
 
 ARG GOPROXY
+ARG BUILD_VERSION
 
 # Override ENTRYPOINT to ensure RUN commands execute correctly
 # The compile image has ENTRYPOINT ["/bin/bash", "-c"] which can interfere with RUN
 ENTRYPOINT []
 
+# version.sh uses bash features such as local, so RUN steps must use bash.
+SHELL ["/bin/bash", "-c"]
+
 # Set GOPROXY environment variable (Go is already installed in compile image)
 ENV GOPROXY=${GOPROXY:-https://proxy.golang.org}
+
+# Make the release version visible to every RUN in this stage so build.sh
+# (get_build_version) and the CSI -ldflags injection produce tag-aligned
+# versions for the binaries packed into the image.
+ENV BUILD_VERSION=${BUILD_VERSION}
 
 # Ensure environment variables are set (from compile image)
 # Go toolchain is already included: PATH="/usr/local/go/bin:...", GOPATH=/go, GOROOT=/usr/local/go
@@ -65,7 +74,8 @@ RUN echo "Building Curvine from source..." && \
 
 # Build CSI binary with version info
 RUN cd /workspace/curvine-csi && \
-    VERSION=$(grep '^version =' /workspace/Cargo.toml | head -1 | sed 's/^version = "\(.*\)"/\1/') && \
+    . /workspace/build/version.sh && \
+    VERSION=$(get_build_version /workspace/Cargo.toml) && \
     GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown") && \
     GIT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "") && \
     GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "") && \
@@ -89,6 +99,13 @@ RUN mkdir -p /build-output && \
     echo "  conf/: $(ls -1 /build-output/conf 2>/dev/null | wc -l) files"
 
 FROM ubuntu:24.04
+
+# BUILD_VERSION is passed from the release CI (tag without the v prefix, e.g.
+# 0.4.0-alpha) and is baked into the CSI binary via -ldflags in the builder
+# stage. Expose it again here for the image metadata label so the published
+# image records the same release version as the tag.
+ARG BUILD_VERSION
+LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 
 # Set non-interactive mode for apt
 ENV DEBIAN_FRONTEND=noninteractive

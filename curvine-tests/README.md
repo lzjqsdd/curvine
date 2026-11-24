@@ -2,6 +2,21 @@
 
 Regression test server and Portal for Curvine (build-server). Test results are written under `curvine-tests/regression_result/` (gitignored).
 
+## Layering Decision
+
+`curvine-tests` remains a top-level workspace member and is the canonical
+repository-wide integration/regression test harness. It owns the regression
+server, Docker image, whole-cluster test helpers, and cross-product test entry
+points, so moving it under a production crate layer such as `crates/client` or
+`crates/server` would make the layer boundary less clear.
+
+The package is intentionally excluded from workspace `default-members`. It may
+depend on server, client, FUSE, native storage, and optional external backend
+paths only for explicit commands such as `cargo test -p curvine-tests` or the
+`curvine-tests` regression image. Production crates must not add normal
+dependencies on `curvine-tests`; verify with `cargo tree -i curvine-tests
+--workspace` and `scripts/check-deps.sh --mode report`.
+
 ## Local Run
 
 From the **project root** (so that `curvine-tests/regression` and project code are visible):
@@ -53,8 +68,22 @@ The dashboard shows all modules with **Run / Cancel** buttons.
 | **FIO** | FIO performance tests (needs a running cluster) |
 | **LTP** | POSIX compliance tests via LTP (needs `/opt/ltp` and cluster) |
 
-> **Dailytest** does not include LTP by default. Trigger LTP separately via the Portal or `/ltp/run` API.  
+> **Dailytest** does not include LTP by default. Trigger LTP separately via the Portal or `/ltp/run` API.
 > LTP requires LTP installed at `/opt/ltp` on the host or in the container.
+>
+> **cvtest (external, preferred for CI)**: the [cvtest repo](https://github.com/CurvineIO/cvtest)
+> maintains the pinned LTP installer (version pinned there — single source
+> of truth), curated suites (`posix-cv-smoke` / `fs-cv` / `syscalls-cv`, …),
+> and the `cvtest run` entrypoint whose JSON matches this Portal's
+> `ltp_test` schema. This repo only invokes it; bumping the LTP version
+> happens in cvtest, not here. PR CI reads the pinned cvtest `ci-fast.txt`
+> manifest, which currently contains only the 53-case `ltp:posix-cv-smoke`
+> suite. It runs in the existing build job and reuses the binaries that job
+> already compiled. Generic `smoketest`, `fs-cv-smoke`, full `syscalls-cv`,
+> and pressure suites are intentionally excluded. The Portal path above stays
+> for local/interactive use with **stock** LTP suites only (`smoketest`,
+> `fs_perms_simple`, `fcntl-locktests`, `fs_bind`). Curated suites such as
+> `posix-cv-smoke` require `cvtest run` — they are not in the stock LTP tree.
 
 Test results are saved under `curvine-tests/regression_result/<timestamp>/`.
 
@@ -128,7 +157,7 @@ docker run \
 ```bash
 docker run \
   -v "$(pwd)":/workspace \
-  -e CURVINE_MASTER_HOSTNAME=192.168.1.100 \
+  -e CURVINE_MASTER_HOSTNAME=192.0.2.100 \
   -p 5002:5002 \
   curvine-tests
 ```

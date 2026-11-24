@@ -1,0 +1,107 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::master::meta::inode::ttl::ttl_bucket::TtlBucket;
+use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
+use crate::master::meta::inode::ttl::InodeTtlExecutor;
+use curvine_error::{FsError, FsResult};
+use curvine_runtime::common::LocalTime;
+use log::{debug, info, warn};
+use std::sync::Arc;
+
+// TTL Checker Module
+//
+// This module provides the core TTL (Time-To-Live) checking and cleanup functionality.
+// It processes expired inodes using a bucket-based approach for efficient batch operations.
+//
+// Key Features:
+// - Bucket-based expiration processing for efficient batch operations
+// - Configurable retry logic with attempt limits
+// - Support for different TTL actions (Delete, Move, Free)
+// - Integration with inode storage and execution systems
+// - Comprehensive cleanup result tracking and statistics
+
+pub struct InodeTtlChecker {
+    bucket_list: Arc<TtlBucketList>,
+    action_executor: InodeTtlExecutor,
+}
+
+impl InodeTtlChecker {
+    /// Create checker with external bucket list (for integration with InodeStore)
+    pub fn new(
+        action_executor: InodeTtlExecutor,
+        bucket_list: Arc<TtlBucketList>,
+    ) -> FsResult<Self> {
+        Ok(Self {
+            action_executor,
+            bucket_list,
+        })
+    }
+
+    pub fn is_serving(&self) -> bool {
+        self.action_executor.is_serving()
+    }
+
+    pub fn cleanup_once(&self) -> FsResult<i64> {
+        let start_time = LocalTime::mills() as i64;
+        let expired_buckets = self.bucket_list.get_expired_buckets_at(start_time);
+
+        if expired_buckets.is_empty() {
+            debug!("no expired buckets found");
+            return Ok(0);
+        }
+
+        info!("found {} expired buckets to process", expired_buckets.len());
+
+        let mut total_processed = 0i64;
+        for bucket in expired_buckets {
+            total_processed += self.process_expired_bucket(bucket)?;
+        }
+
+        Ok(total_processed)
+    }
+
+    fn process_expired_bucket(&self, bucket: Arc<TtlBucket>) -> FsResult<i64> {
+        let inode_ids = bucket.drain();
+        let total = inode_ids.len() as i64;
+
+        for inode_id in inode_ids.iter().copied() {
+            if !self.is_serving() {
+                bucket.add(inode_id);
+                continue;
+            }
+            match self.action_executor.execute_by_id(inode_id) {
+                Err(e) => {
+                    // A missing inode means it was already removed (e.g. by a
+                    // concurrent delete); there is nothing left to clean up.
+                    if !matches!(e, FsError::FileNotFound(_)) {
+                        warn!(
+                            "error processing inode {}: {} (dropped from TTL scan until re-indexed)",
+                            inode_id, e
+                        );
+                    }
+                }
+                Ok((false, inode, _)) => {
+                    self.bucket_list.add(&inode);
+                }
+
+                _ => (),
+            }
+        }
+
+        self.bucket_list.put_back(&bucket);
+
+        Ok(total)
+    }
+}

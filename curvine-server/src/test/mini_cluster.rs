@@ -15,24 +15,33 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::Master;
+#[cfg(feature = "fault-injection")]
+use crate::worker::block::BlockStore;
 use crate::worker::Worker;
-use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::raft::{NodeId, RaftPeer};
-use curvine_common::FsResult;
+use curvine_client_core::file::CurvineFileSystem;
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_data_transfer::transfer::EmbeddedTransfer;
+use curvine_error::FsResult;
+use curvine_net::net::{InetAddr, NetUtils};
+use curvine_raft::raft::{NodeId, RaftPeer};
+use curvine_rpc::client::RpcClient;
+#[cfg(feature = "fault-injection")]
+use curvine_rpc::handler::HandlerService;
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::DashMap;
 use log::info;
-use orpc::client::RpcClient;
-use orpc::common::LocalTime;
-use orpc::io::net::{InetAddr, NetUtils};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::{err_box, CommonResult};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-pub struct MasterEntry(MasterFilesystem, Arc<MasterReplicationManager>);
+pub struct MasterEntry(
+    MasterFilesystem,
+    Arc<MasterReplicationManager>,
+    Option<Arc<EmbeddedTransfer>>,
+);
 
 // A cluster of unit tests.
 pub struct MiniCluster {
@@ -42,6 +51,9 @@ pub struct MiniCluster {
     pub worker_conf: Vec<ClusterConf>,
 
     pub master_entries: DashMap<usize, MasterEntry>,
+    // Retain the live stores so fault tests can remove a real replica, not just metadata.
+    #[cfg(feature = "fault-injection")]
+    pub worker_stores: DashMap<u32, BlockStore>,
     pub client_rt: Arc<Runtime>,
 }
 
@@ -70,6 +82,8 @@ impl MiniCluster {
             master_conf,
             worker_conf,
             master_entries: Default::default(),
+            #[cfg(feature = "fault-injection")]
+            worker_stores: Default::default(),
             client_rt,
         }
     }
@@ -108,16 +122,38 @@ impl MiniCluster {
             let master = Master::with_conf(conf.clone()).unwrap();
             self.master_entries.insert(
                 index,
-                MasterEntry(master.get_fs(), master.get_replication_manager()),
+                MasterEntry(
+                    master.get_fs(),
+                    master.get_replication_manager(),
+                    // The embedded transfer is built with the master but only
+                    // starts once the RPC server listens, so the handle is valid
+                    // from here on.
+                    master.embedded_transfer(),
+                ),
             );
-            thread::spawn(move || master.block_on_start());
+            thread::spawn(move || {
+                if let Err(e) = master.block_on_start() {
+                    log::error!("mini cluster master failed to start: {}", e);
+                    std::process::abort();
+                }
+            });
         }
     }
 
     pub fn start_worker(&self) {
         for conf in &self.worker_conf {
             let worker = Worker::with_conf(conf.clone()).unwrap();
-            thread::spawn(move || worker.block_on_start());
+            #[cfg(feature = "fault-injection")]
+            self.worker_stores.insert(
+                worker.worker_id,
+                worker.service().get_message_handler(None).store,
+            );
+            thread::spawn(move || {
+                if let Err(e) = worker.block_on_start() {
+                    log::error!("mini cluster worker failed to start: {}", e);
+                    std::process::abort();
+                }
+            });
         }
     }
 
@@ -207,7 +243,7 @@ impl MiniCluster {
 
         while LocalTime::mills() <= wait_time {
             retry_count += 1;
-            let info = match fs.get_master_info().await {
+            let info = match fs.get_filesystem_info().await {
                 Ok(info) => info,
                 Err(e) => {
                     return Err(e);
@@ -271,6 +307,20 @@ impl MiniCluster {
             .unwrap()
     }
 
+    /// Live worker count of the embedded transfer instance running in the active
+    /// master, or `None` before its first cluster-snapshot refresh.
+    ///
+    /// Unlike the process-global `transfer_cluster_snapshot_live_workers` gauge
+    /// this is scoped to this cluster, so a concurrent cluster cannot satisfy a
+    /// wait on this one.
+    pub fn embedded_transfer_snapshot_live_workers(&self) -> Option<usize> {
+        self.master_entries
+            .iter()
+            .find(|x| x.0.master_monitor.is_active())
+            .and_then(|x| x.2.clone())
+            .and_then(|transfer| transfer.snapshot_live_workers())
+    }
+
     // Create the default master node configuration.
     // Multiple masters can be created
     fn default_master_conf(conf: &ClusterConf, num: u16) -> Vec<ClusterConf> {
@@ -312,6 +362,13 @@ impl MiniCluster {
                 .expect("Failed to initialize master config");
             item.fuse.init().expect("Failed to initialize fuse config");
             item.job.init().expect("Failed to initialize job config");
+            // Embedded transfer runs inside the master. Its duration fields are
+            // derived from the `*_str` defaults by `init()`, so a MiniCluster
+            // built from `ClusterConf::default()` must initialize it here;
+            // otherwise the scheduler leases jobs for zero milliseconds.
+            item.transfer
+                .init()
+                .expect("Failed to initialize transfer config");
         }
 
         list

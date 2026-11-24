@@ -1,0 +1,2202 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use bytes::BytesMut;
+use curvine_core_error::ErrorExt;
+use curvine_core_error::{err_box, err_ext, try_option_mut};
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
+use curvine_io::DataSlice;
+use curvine_model::{DeleteResult, FileStatus, FileType, ListOptions, SetAttrOpts, StoragePolicy};
+use curvine_ufs_api::OpendalConf;
+#[cfg(feature = "opendal-oss")]
+use curvine_ufs_api::OssHdfsConf;
+use curvine_ufs_api::{err_ufs, FOLDER_SUFFIX};
+use futures::future::ready;
+use futures::stream::TryStreamExt;
+use futures::StreamExt;
+use opendal::services::*;
+use opendal::{
+    layers::{LoggingLayer, RetryLayer, TimeoutLayer},
+    ErrorKind, Metadata, Operator,
+};
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::time::Duration;
+use tokio::time::error::Elapsed;
+
+fn storage_error(
+    operation: impl AsRef<str>,
+    path: impl AsRef<str>,
+    e: impl std::fmt::Display,
+    not_found: bool,
+) -> FsError {
+    if not_found {
+        FsError::file_not_found(path.as_ref()).ctx(format!("{}: {}", operation.as_ref(), e))
+    } else {
+        FsError::common(format!("{} {}: {}", operation.as_ref(), path.as_ref(), e))
+    }
+}
+
+#[cfg(all(test, feature = "opendal-s3"))]
+mod s3_settings_tests {
+    use super::S3OperatorSettings;
+    use std::collections::HashMap;
+
+    fn config(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut conf = HashMap::from([
+            (
+                "s3.endpoint_url".to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            ("s3.region_name".to_string(), "cn-test-1".to_string()),
+        ]);
+        for (key, value) in entries {
+            conf.insert((*key).to_string(), (*value).to_string());
+        }
+        conf
+    }
+
+    #[test]
+    fn static_credentials_are_forwarded() {
+        let settings = S3OperatorSettings::from_conf(&config(&[
+            ("s3.credentials.access", "ak"),
+            ("s3.credentials.secret", "sk"),
+        ]))
+        .expect("static credentials must resolve");
+
+        assert_eq!(settings.access_key_id.as_deref(), Some("ak"));
+        assert_eq!(settings.secret_access_key.as_deref(), Some("sk"));
+        assert_eq!(settings.session_token, None);
+        assert_eq!(settings.role_arn, None);
+        assert!(settings.force_path_style);
+        assert!(!settings.disable_config_load);
+        assert!(!settings.disable_ec2_metadata);
+    }
+
+    #[test]
+    fn sts_credentials_forward_the_session_token() {
+        let settings = S3OperatorSettings::from_conf(&config(&[
+            ("s3.credentials.type", "sts"),
+            ("s3.credentials.access", "ak"),
+            ("s3.credentials.secret", "sk"),
+            ("s3.credentials.token", "token"),
+        ]))
+        .expect("sts credentials must resolve");
+
+        assert_eq!(settings.access_key_id.as_deref(), Some("ak"));
+        assert_eq!(settings.session_token.as_deref(), Some("token"));
+        assert_eq!(settings.role_arn, None);
+    }
+
+    #[test]
+    fn role_credentials_leave_the_keys_unset() {
+        let settings = S3OperatorSettings::from_conf(&config(&[
+            ("s3.credentials.type", "role"),
+            ("s3.credentials.role_arn", "arn:aws:iam::1:role/ufs"),
+            ("s3.credentials.role_session_name", "curvine"),
+            ("s3.credentials.external_id", "ext"),
+            ("s3.credentials.disable_ec2_metadata", "true"),
+        ]))
+        .expect("a role mount needs no key");
+
+        assert_eq!(settings.access_key_id, None);
+        assert_eq!(settings.secret_access_key, None);
+        assert_eq!(
+            settings.role_arn.as_deref(),
+            Some("arn:aws:iam::1:role/ufs")
+        );
+        assert_eq!(settings.role_session_name.as_deref(), Some("curvine"));
+        assert_eq!(settings.external_id.as_deref(), Some("ext"));
+        assert!(settings.disable_ec2_metadata);
+    }
+
+    #[test]
+    fn auto_credentials_leave_every_credential_field_unset() {
+        let settings = S3OperatorSettings::from_conf(&config(&[("s3.credentials.type", "auto")]))
+            .expect("auto must resolve without any credential field");
+
+        assert_eq!(settings.access_key_id, None);
+        assert_eq!(settings.secret_access_key, None);
+        assert_eq!(settings.session_token, None);
+        assert_eq!(settings.role_arn, None);
+        assert_eq!(settings.endpoint.as_deref(), Some("http://s3.example.com"));
+        assert_eq!(settings.region.as_deref(), Some("cn-test-1"));
+    }
+
+    #[test]
+    fn path_style_and_list_object_switches_are_preserved() {
+        let settings = S3OperatorSettings::from_conf(&config(&[
+            ("s3.credentials.type", "auto"),
+            ("s3.force.path.style", "false"),
+            ("s3.list_objects_version", "v1"),
+        ]))
+        .expect("switches must resolve");
+
+        assert!(!settings.force_path_style);
+        assert!(settings.disable_list_objects_v2);
+    }
+
+    #[test]
+    fn invalid_credential_configuration_surfaces_as_an_error() {
+        let err = S3OperatorSettings::from_conf(&config(&[("s3.credentials.type", "role")]))
+            .expect_err("role without role_arn must fail before an operator is built");
+        assert!(err.to_string().contains("s3.credentials.role_arn"), "{err}");
+    }
+}
+
+#[cfg(all(test, any(feature = "opendal-hdfs", feature = "opendal-hdfs-native")))]
+mod tests {
+    use super::OpendalFileSystem;
+    use std::collections::HashMap;
+
+    fn config(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn hdfs_provider_selects_native_backend() {
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[])));
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "native"
+        )])));
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "HDFS-NATIVE"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "jvm"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "unknown"
+        )])));
+    }
+
+    #[test]
+    fn legacy_hdfs_native_flag_is_used_only_without_provider() {
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.native",
+            "true"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.native",
+            "false"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[
+            ("hdfs.provider", "jvm"),
+            ("hdfs.native", "true"),
+        ])));
+    }
+}
+
+fn opendal_error(operation: impl AsRef<str>, path: impl AsRef<str>, e: opendal::Error) -> FsError {
+    let not_found = e.kind() == ErrorKind::NotFound;
+    storage_error(operation, path, e, not_found)
+}
+
+fn opendal_io_error(
+    operation: impl AsRef<str>,
+    path: impl AsRef<str>,
+    e: std::io::Error,
+) -> FsError {
+    let not_found = e.kind() == std::io::ErrorKind::NotFound;
+    storage_error(operation, path, e, not_found)
+}
+
+/// Everything the S3 backend needs from the mount configuration, resolved from the shared
+/// [`curvine_ufs_api::S3Conf`] credential plan.
+///
+/// Kept separate from the builder wiring so the mapping can be unit-tested: which builder calls an
+/// operator is only observable through a signed request, which a unit test cannot see.
+#[cfg(feature = "opendal-s3")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct S3OperatorSettings {
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    /// Defaults to true for backward compatibility (MinIO, Ceph RGW, localstack, ...). Object
+    /// stores that only support virtual-host style opt in with `s3.force.path.style=false`.
+    pub force_path_style: bool,
+    pub disable_list_objects_v2: bool,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub role_arn: Option<String>,
+    pub external_id: Option<String>,
+    pub role_session_name: Option<String>,
+    pub disable_config_load: bool,
+    pub disable_ec2_metadata: bool,
+}
+
+#[cfg(feature = "opendal-s3")]
+impl S3OperatorSettings {
+    pub(crate) fn from_conf(conf: &HashMap<String, String>) -> FsResult<Self> {
+        let credential = curvine_ufs_api::S3Conf::credential_plan(conf)?;
+
+        Ok(Self {
+            endpoint: conf.get("s3.endpoint_url").cloned(),
+            region: conf.get("s3.region_name").cloned(),
+            force_path_style: conf
+                .get("s3.force.path.style")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
+            disable_list_objects_v2: curvine_ufs_api::S3Conf::uses_list_objects_v1(conf)?,
+            access_key_id: credential.access_key,
+            secret_access_key: credential.secret_key,
+            session_token: credential.session_token,
+            role_arn: credential.role_arn,
+            external_id: credential.external_id,
+            role_session_name: credential.role_session_name,
+            disable_config_load: credential.disable_config_load,
+            disable_ec2_metadata: credential.disable_ec2_metadata,
+        })
+    }
+
+    pub(crate) fn apply(self, mut builder: S3) -> S3 {
+        if let Some(endpoint) = &self.endpoint {
+            builder = builder.endpoint(endpoint);
+        }
+        if let Some(region) = &self.region {
+            builder = builder.region(region);
+        }
+
+        // Static keys and STS temporary credentials. `None` leaves the field unset so the SDK
+        // default chain (env, ~/.aws/*, IMDSv2, web identity token file) can resolve it.
+        if let Some(access_key) = &self.access_key_id {
+            builder = builder.access_key_id(access_key);
+        }
+        if let Some(secret_key) = &self.secret_access_key {
+            builder = builder.secret_access_key(secret_key);
+        }
+        if let Some(token) = &self.session_token {
+            builder = builder.session_token(token);
+        }
+
+        // AssumeRole: the source credential is either the key pair above or whatever the default
+        // chain resolves.
+        if let Some(role_arn) = &self.role_arn {
+            builder = builder.role_arn(role_arn);
+        }
+        if let Some(external_id) = &self.external_id {
+            builder = builder.external_id(external_id);
+        }
+        if let Some(role_session_name) = &self.role_session_name {
+            builder = builder.role_session_name(role_session_name);
+        }
+
+        if self.disable_config_load {
+            builder = builder.disable_config_load();
+        }
+        if self.disable_ec2_metadata {
+            builder = builder.disable_ec2_metadata();
+        }
+
+        if !self.force_path_style {
+            builder = builder.enable_virtual_host_style();
+        }
+
+        if self.disable_list_objects_v2 {
+            builder = builder.disable_list_objects_v2();
+        }
+
+        builder
+    }
+}
+
+/// The error returned when a UFS operation exceeds its deadline.
+///
+/// It is built from the elapsed timer so it converts to `FsError::Timeout`,
+/// which FUSE maps to `ETIMEDOUT` instead of a generic `EIO`. `knob` names the
+/// setting that bounds this operation so the message says what to tune.
+fn deadline_error(
+    operation: &str,
+    path: &str,
+    knob: &str,
+    timeout: Duration,
+    elapsed: Elapsed,
+) -> FsError {
+    log::warn!(
+        "UFS operation {} on {} exceeded the {:?} deadline ({})",
+        operation,
+        path,
+        timeout,
+        elapsed
+    );
+    FsError::from(elapsed).ctx(format!(
+        "{} {} exceeded {} {:?}",
+        operation, path, knob, timeout
+    ))
+}
+
+/// A fresh `FsError::Timeout` with the given context.
+///
+/// `tokio::time::error::Elapsed` has no public constructor, so take one from
+/// a timer that has already expired.
+async fn timeout_error(ctx: String) -> FsError {
+    match tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await {
+        Err(elapsed) => FsError::from(elapsed).ctx(ctx),
+        Ok(()) => unreachable!("a pending future never completes"),
+    }
+}
+
+/// Bound one UFS operation by a single hard deadline.
+///
+/// `opendal`'s `TimeoutLayer` bounds one *attempt* and `RetryLayer` re-arms it up
+/// to `retry_times + 1` times, so a blackholed object-store path can keep a
+/// foreground call started for `(retry_times + 1) * attempt_timeout` plus
+/// backoff. This wrapper sits outside both layers and bounds the whole call,
+/// including its internal retries, so every foreground operation reaches a
+/// terminal state within `opendal.operation_timeout`.
+async fn with_deadline<T>(
+    timeout: Duration,
+    operation: &str,
+    path: &str,
+    fut: impl std::future::Future<Output = FsResult<T>>,
+) -> FsResult<T> {
+    with_named_deadline(
+        OpendalConf::OPERATION_TIMEOUT,
+        timeout,
+        operation,
+        path,
+        fut,
+    )
+    .await
+}
+
+/// [`with_deadline`] for an operation bounded by the setting `knob`.
+async fn with_named_deadline<T>(
+    knob: &str,
+    timeout: Duration,
+    operation: &str,
+    path: &str,
+    fut: impl std::future::Future<Output = FsResult<T>>,
+) -> FsResult<T> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(res) => res,
+        Err(elapsed) => Err(deadline_error(operation, path, knob, timeout, elapsed)),
+    }
+}
+
+pub enum ReadPolicy {
+    Sequential,
+    Random,
+}
+
+impl ReadPolicy {
+    pub fn is_random(&self) -> bool {
+        matches!(self, ReadPolicy::Random)
+    }
+}
+
+/// OpenDAL Reader implementation
+pub struct OpendalReader {
+    operator: Operator,
+    path: Path,
+    object_path: String,
+    length: i64,
+    pos: i64,
+    chunk: DataSlice,
+    chunk_size: usize,
+    concurrent: usize,
+    byte_stream: Option<opendal::FuturesBytesStream>,
+    status: FileStatus,
+    read_policy: ReadPolicy,
+    /// Hard upper bound for one chunk fetch, including opendal's own retries.
+    operation_timeout: Duration,
+}
+
+impl OpendalReader {
+    /// Fetch the next chunk without the outer deadline; see [`Reader::read_chunk0`].
+    async fn read_chunk0_inner(&mut self) -> FsResult<DataSlice> {
+        if !self.has_remaining() {
+            self.byte_stream = None;
+            return Ok(DataSlice::Empty);
+        }
+
+        if self.read_policy.is_random() {
+            self.byte_stream = None;
+
+            let start = self.pos as u64;
+            let end = start
+                .saturating_add(self.chunk_size as u64)
+                .min(self.length as u64);
+
+            let data = self
+                .operator
+                .read_with(&self.object_path)
+                .range(start..end)
+                .await
+                .map_err(|e| opendal_error("Failed to read random range", &self.object_path, e))?
+                .to_bytes();
+            let expected = (end - start) as usize;
+            if data.len() != expected {
+                return err_box!(format!(
+                    "short random range read at {}: expected {} bytes, got {}",
+                    self.pos,
+                    expected,
+                    data.len()
+                ));
+            }
+
+            self.read_policy = ReadPolicy::Sequential;
+            return Ok(DataSlice::Bytes(data));
+        }
+
+        if self.byte_stream.is_none() {
+            let reader = self
+                .operator
+                .reader_with(&self.object_path)
+                .chunk(self.chunk_size)
+                .concurrent(self.concurrent)
+                .await
+                .map_err(|e| opendal_error("Failed to create reader", &self.object_path, e))?;
+
+            self.byte_stream = Some(
+                reader
+                    .into_bytes_stream(self.pos as u64..self.length as u64)
+                    .await
+                    .map_err(|e| opendal_error("Failed to create stream", &self.object_path, e))?,
+            );
+        }
+
+        let next = match self.byte_stream.as_mut() {
+            Some(stream) => stream.next().await,
+            None => return err_box!("byte stream is not initialized"),
+        };
+        match next {
+            Some(Ok(chunk)) => Ok(DataSlice::Bytes(chunk)),
+            Some(Err(e)) => {
+                self.byte_stream = None;
+                Err(opendal_io_error(
+                    "Failed to read chunk",
+                    &self.object_path,
+                    e,
+                ))
+            }
+            None => {
+                self.byte_stream = None;
+                err_box!(format!(
+                    "stream ended before EOF at {} (file length {})",
+                    self.pos, self.length
+                ))
+            }
+        }
+    }
+}
+
+impl Reader for OpendalReader {
+    fn status(&self) -> &FileStatus {
+        &self.status
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn len(&self) -> i64 {
+        self.length
+    }
+
+    fn chunk_mut(&mut self) -> &mut DataSlice {
+        &mut self.chunk
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    fn pos(&self) -> i64 {
+        self.pos
+    }
+
+    fn pos_mut(&mut self) -> &mut i64 {
+        &mut self.pos
+    }
+
+    async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
+        let timeout = self.operation_timeout;
+        let object_path = self.object_path.clone();
+        with_deadline(timeout, "read", &object_path, self.read_chunk0_inner()).await
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 || pos > self.length {
+            return err_box!("Invalid seek position");
+        }
+
+        if pos == self.pos {
+            return Ok(());
+        }
+
+        let to_skip = pos - self.pos;
+        if to_skip >= 0 && to_skip <= self.chunk.len() as i64 {
+            self.chunk.advance(to_skip as usize);
+        } else {
+            self.chunk.clear();
+            self.byte_stream = None;
+            self.read_policy = ReadPolicy::Random;
+        }
+
+        self.pos = pos;
+        Ok(())
+    }
+
+    async fn complete(&mut self) -> FsResult<()> {
+        self.byte_stream = None;
+        self.chunk = DataSlice::Empty;
+        Ok(())
+    }
+}
+
+/// OpenDAL Writer implementation
+pub struct OpendalWriter {
+    operator: Operator,
+    path: Path,
+    object_path: String,
+    status: FileStatus,
+    pos: i64,
+    chunk: BytesMut,
+    chunk_size: usize,
+    writer: Option<opendal::Writer>,
+    /// Hard upper bound for one chunk upload or abort, including opendal's own
+    /// retries.
+    operation_timeout: Duration,
+    /// Hard upper bound for the close that commits the object.
+    commit_timeout: Duration,
+    /// The first failed upload step. A failed or timed-out chunk upload has
+    /// already drained its bytes from `chunk`, and a failed close has already
+    /// dropped `writer`, so the object can no longer be committed correctly.
+    /// Once set, every later write, flush, and complete fails instead of
+    /// reporting a partial or missing upload as committed.
+    failed: Option<WriterFailure>,
+}
+
+/// The first failure of an [`OpendalWriter`], kept so a retried call reports
+/// the same kind of error: a timeout stays `FsError::Timeout` (ETIMEDOUT)
+/// instead of degrading to a generic error (EIO).
+struct WriterFailure {
+    timed_out: bool,
+    cause: String,
+}
+
+impl OpendalWriter {
+    async fn check_not_failed(&self) -> FsResult<()> {
+        let Some(failure) = &self.failed else {
+            return Ok(());
+        };
+        let msg = format!(
+            "UFS writer for {} already failed and cannot be completed: {}",
+            self.object_path, failure.cause
+        );
+        if failure.timed_out {
+            Err(timeout_error(msg).await)
+        } else {
+            err_box!(msg)
+        }
+    }
+
+    /// Make the first upload failure sticky (see [`Self::failed`]) and abort
+    /// the multipart upload it leaves behind.
+    async fn record_failure<T>(&mut self, res: FsResult<T>) -> FsResult<T> {
+        if let Err(e) = &res {
+            if self.failed.is_none() {
+                self.failed = Some(WriterFailure {
+                    timed_out: matches!(e, FsError::Timeout(_)),
+                    cause: e.to_string(),
+                });
+            }
+            self.abort_upload().await;
+        }
+        res
+    }
+
+    /// Best-effort abort of the multipart upload, bounded by
+    /// `opendal.operation_timeout`, so a failed or cancelled writer does not
+    /// leave an incomplete upload whose parts the object store keeps billing.
+    ///
+    /// The abort only reaches the store while `writer` is intact. opendal's
+    /// `RetryLayer` moves the inner writer into a running `write`/`close`, so
+    /// when the deadline drops that call the upload id is dropped with it and
+    /// nothing can abort the upload from here; a bucket lifecycle rule
+    /// (`AbortIncompleteMultipartUpload`) has to clean up that case. A failed
+    /// abort is only logged: the caller keeps the error that caused it.
+    async fn abort_upload(&mut self) {
+        let Some(mut writer) = self.writer.take() else {
+            return;
+        };
+        let object_path = self.object_path.clone();
+        let abort_path = object_path.clone();
+        let res = with_deadline(self.operation_timeout, "abort", &object_path, async move {
+            writer
+                .abort()
+                .await
+                .map_err(|e| opendal_error("Failed to abort writer", &abort_path, e))
+        })
+        .await;
+        if let Err(e) = res {
+            log::warn!(
+                "Failed to abort the upload of {}, its parts may stay in the object store: {}",
+                object_path,
+                e
+            );
+        }
+    }
+
+    /// Upload one chunk without the outer deadline; see [`Writer::write_chunk`].
+    async fn write_chunk_inner(&mut self, chunk: DataSlice) -> FsResult<i64> {
+        if self.writer.is_none() {
+            self.writer = Some(
+                self.operator
+                    .writer(&self.object_path)
+                    .await
+                    .map_err(|e| opendal_error("Failed to create writer", &self.object_path, e))?,
+            );
+        }
+
+        let data = chunk.to_bytes();
+        let len = data.len();
+
+        let writer = try_option_mut!(self.writer);
+        writer
+            .write(data)
+            .await
+            .map_err(|e| opendal_error("Failed to write", &self.object_path, e))?;
+
+        Ok(len as i64)
+    }
+}
+
+impl Writer for OpendalWriter {
+    fn status(&self) -> &FileStatus {
+        &self.status
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn pos(&self) -> i64 {
+        self.pos
+    }
+
+    fn pos_mut(&mut self) -> &mut i64 {
+        &mut self.pos
+    }
+
+    fn chunk_mut(&mut self) -> &mut BytesMut {
+        &mut self.chunk
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
+        self.check_not_failed().await?;
+        let timeout = self.operation_timeout;
+        let object_path = self.object_path.clone();
+        let res = with_deadline(
+            timeout,
+            "write",
+            &object_path,
+            self.write_chunk_inner(chunk),
+        )
+        .await;
+        self.record_failure(res).await
+    }
+
+    async fn flush(&mut self) -> FsResult<()> {
+        self.check_not_failed().await?;
+        self.flush_chunk().await?;
+        Ok(())
+    }
+
+    async fn complete(&mut self) -> FsResult<()> {
+        self.flush().await?;
+
+        if self.writer.is_some() {
+            // `close` uploads the last part and, for a multipart upload, sends
+            // CompleteMultipartUpload, whose duration grows with the number of
+            // parts, so it is bounded by `opendal.commit_timeout`.
+            let timeout = self.commit_timeout;
+            let object_path = self.object_path.clone();
+            let writer = try_option_mut!(self.writer);
+            let res = with_named_deadline(
+                OpendalConf::COMMIT_TIMEOUT,
+                timeout,
+                "complete",
+                &object_path,
+                async {
+                    writer
+                        .close()
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| opendal_error("Failed to close writer", &object_path, e))
+                },
+            )
+            .await;
+            if res.is_ok() {
+                self.writer = None;
+            }
+            self.record_failure(res).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cancel(&mut self) -> FsResult<()> {
+        self.abort_upload().await;
+        Ok(())
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if self.pos != pos {
+            err_box!("not support random write")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// OpenDAL file system implementation
+#[derive(Clone)]
+pub struct OpendalFileSystem {
+    operator: Operator,
+    scheme: String,
+    bucket_or_container: String,
+    /// Per-object Range size (bytes), configured through OpendalConf.
+    read_chunk_size: usize,
+    /// Concurrent sequential Range requests per object, configured through OpendalConf.
+    read_concurrent: usize,
+    /// Hard upper bound for one UFS operation, including opendal's internal
+    /// retries. Configured through `opendal.operation_timeout`.
+    operation_timeout: Duration,
+    /// Longest silence a directory listing may show before it fails. Every page
+    /// pull is bounded by [`Self::operation_timeout`]; this catches a listing
+    /// that keeps answering without ever yielding an entry. Configured through
+    /// `opendal.list_idle_timeout`.
+    list_idle_timeout: Duration,
+    /// Hard upper bound for a UFS operation whose duration grows with the
+    /// object size. Configured through `opendal.commit_timeout`.
+    commit_timeout: Duration,
+}
+
+impl OpendalFileSystem {
+    /// Bound the given UFS operation by [`Self::operation_timeout`].
+    async fn with_deadline<T>(
+        &self,
+        operation: &str,
+        path: &str,
+        fut: impl std::future::Future<Output = FsResult<T>>,
+    ) -> FsResult<T> {
+        with_deadline(self.operation_timeout, operation, path, fut).await
+    }
+
+    fn add_stability_layers(
+        base_op: Operator,
+        conf: &HashMap<String, String>,
+    ) -> FsResult<Operator> {
+        let opendal_conf = OpendalConf::from_map(conf)
+            .map_err(|e| FsError::common(format!("Failed to parse OpenDAL config: {}", e)))?;
+
+        let total_timeout_ms = opendal_conf.total_timeout_ms();
+        // The per-attempt limit of non-IO operations (opendal default 60s) also
+        // applies to a server-side `copy`, so keep it at least as long as
+        // `opendal.commit_timeout`; otherwise every copy attempt would fail at
+        // 60s whatever that setting says. Short operations are still bounded by
+        // `opendal.operation_timeout` outside the retry loop.
+        let attempt_timeout = opendal_conf.commit_timeout.max(Duration::from_secs(60));
+
+        let op = base_op
+            .layer(LoggingLayer::default())
+            .layer(
+                TimeoutLayer::new()
+                    .with_timeout(attempt_timeout)
+                    .with_io_timeout(Duration::from_millis(total_timeout_ms)),
+            )
+            .layer(
+                RetryLayer::new()
+                    .with_min_delay(Duration::from_millis(opendal_conf.retry_interval_ms))
+                    .with_max_delay(Duration::from_millis(opendal_conf.retry_max_delay_ms))
+                    .with_max_times(opendal_conf.retry_times as usize)
+                    .with_factor(2.0)
+                    .with_jitter(),
+            );
+
+        Ok(op)
+    }
+
+    pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
+        let scheme = path
+            .scheme()
+            .ok_or_else(|| FsError::invalid_path(path.full_path(), "Missing scheme"))?;
+
+        let conf = if matches!(scheme, "s3" | "s3a") {
+            curvine_ufs_api::S3Conf::canonicalize_properties(conf)?
+        } else {
+            conf
+        };
+
+        let bucket_or_container = path
+            .authority()
+            .ok_or_else(|| {
+                FsError::invalid_path(path.full_path(), "URI missing bucket/container name")
+            })?
+            .to_string();
+
+        let operator = match scheme {
+            FsKind::SCHEME_FILE => {
+                let builder = Fs::default().root("/");
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create FS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            // OSS native implementation (higher priority than HDFS-based OSS)
+            #[cfg(feature = "opendal-oss")]
+            "oss" => {
+                let mut builder = Oss::default();
+                builder = builder.bucket(&bucket_or_container);
+
+                if let Some(endpoint) = conf.get(OssHdfsConf::USER_ENDPOINT) {
+                    builder = builder.endpoint(endpoint);
+                }
+                if let Some(access_key) = conf.get(OssHdfsConf::USER_ACCESS_KEY_ID) {
+                    builder = builder.access_key_id(access_key);
+                }
+                if let Some(secret_key) = conf.get(OssHdfsConf::USER_ACCESS_KEY_SECRET) {
+                    builder = builder.access_key_secret(secret_key);
+                }
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create OSS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            #[cfg(any(feature = "opendal-hdfs", feature = "opendal-hdfs-native"))]
+            "hdfs" => Self::create_hdfs_operator(&bucket_or_container, &conf)?,
+
+            #[cfg(feature = "opendal-webhdfs")]
+            "webhdfs" => {
+                let mut builder = Webhdfs::default();
+
+                let endpoint = if let Some(endpoint_config) = conf.get("webhdfs.endpoint") {
+                    endpoint_config.clone()
+                } else {
+                    format!("http://{}", bucket_or_container)
+                };
+
+                builder = builder.endpoint(&endpoint);
+
+                let root_path = conf.get("webhdfs.root").map(|s| s.as_str()).unwrap_or("/");
+                builder = builder.root(root_path);
+
+                let atomic_dir = format!("{}/atomic_write_dir", root_path);
+                builder = builder.atomic_write_dir(&atomic_dir);
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| {
+                        FsError::common(format!("Failed to create WebHDFS operator: {}", e))
+                    })?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            #[cfg(feature = "opendal-s3")]
+            "s3" | "s3a" => {
+                // Every credential shape (static key, STS temporary credential, AssumeRole, or the
+                // SDK default chain) is resolved by the shared `S3Conf` plan, so a mount can carry
+                // an identity instead of a long-lived key.
+                //
+                // `s3.force.path.style` defaults to true for backward compatibility; object stores
+                // like TOS/OSS only support virtual-host style and must opt in with `=false`.
+                //
+                // Select the S3 ListObjects API version via `s3.list_objects_version`.
+                // Defaults to v2 (OpenDAL's default). Some S3-compatible services (e.g. Baidu BOS)
+                // return `is_truncated=true` in a ListObjectsV2 response but omit the
+                // `NextContinuationToken`; OpenDAL's v2 lister then resends the request with an
+                // empty token, gets the same page back, and loops forever (mount/list hangs).
+                // Setting `s3.list_objects_version=v1` switches to ListObjects v1, whose lister
+                // falls back to using the last object key as the marker and advances correctly.
+                let settings = S3OperatorSettings::from_conf(&conf)?;
+                let builder = settings.apply(S3::default().bucket(&bucket_or_container));
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            #[cfg(feature = "opendal-gcs")]
+            "gcs" | "gs" => {
+                let mut builder = Gcs::default();
+                builder = builder.bucket(&bucket_or_container);
+
+                if let Some(service_account) = conf.get("gcs.service_account") {
+                    builder = builder.credential(service_account);
+                }
+                if let Some(endpoint) = conf.get("gcs.endpoint_url") {
+                    builder = builder.endpoint(endpoint);
+                }
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create GCS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            #[cfg(feature = "opendal-azblob")]
+            "azblob" => {
+                let mut builder = Azblob::default();
+                builder = builder.container(&bucket_or_container);
+
+                if let Some(account_name) = conf.get("azure.account_name") {
+                    builder = builder.account_name(account_name);
+                }
+                if let Some(account_key) = conf.get("azure.account_key") {
+                    builder = builder.account_key(account_key);
+                }
+                if let Some(endpoint) = conf.get("azure.endpoint_url") {
+                    builder = builder.endpoint(endpoint);
+                }
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| {
+                        FsError::common(format!("Failed to create Azure operator: {}", e))
+                    })?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            #[cfg(feature = "opendal-cos")]
+            "cos" => {
+                let mut builder = Cos::default();
+                builder = builder.bucket(&bucket_or_container);
+
+                if let Some(endpoint) = conf.get("cos.endpoint_url") {
+                    builder = builder.endpoint(endpoint);
+                }
+                if let Some(access_key) = conf.get("cos.credentials.access") {
+                    builder = builder.secret_id(access_key);
+                }
+                if let Some(secret_key) = conf.get("cos.credentials.secret") {
+                    builder = builder.secret_key(secret_key);
+                }
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create COS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            _ => {
+                return Err(FsError::unsupported(format!(
+                    "Unsupported scheme: {}",
+                    scheme
+                )));
+            }
+        };
+
+        let opendal_conf = OpendalConf::from_map(&conf)
+            .map_err(|e| FsError::common(format!("Failed to parse OpenDAL config: {}", e)))?;
+
+        Ok(Self {
+            operator,
+            scheme: scheme.to_string(),
+            bucket_or_container,
+            read_chunk_size: opendal_conf.read_chunk_size,
+            read_concurrent: opendal_conf.read_concurrent,
+            operation_timeout: opendal_conf.operation_timeout,
+            list_idle_timeout: opendal_conf.list_idle_timeout,
+            commit_timeout: opendal_conf.commit_timeout,
+        })
+    }
+
+    #[cfg(any(feature = "opendal-hdfs", feature = "opendal-hdfs-native"))]
+    fn create_hdfs_operator(
+        bucket_or_container: &str,
+        conf: &HashMap<String, String>,
+    ) -> FsResult<Operator> {
+        if Self::use_hdfs_native(conf) {
+            #[cfg(feature = "opendal-hdfs-native")]
+            {
+                return Self::create_hdfs_native_operator(bucket_or_container, conf);
+            }
+
+            #[cfg(not(feature = "opendal-hdfs-native"))]
+            {
+                return err_box!("opendal hdfs-native provider is not enabled");
+            }
+        }
+
+        #[cfg(feature = "opendal-hdfs")]
+        {
+            return Self::create_hdfs_jvm_operator(bucket_or_container, conf);
+        }
+
+        #[cfg(all(not(feature = "opendal-hdfs"), feature = "opendal-hdfs-native"))]
+        {
+            Self::create_hdfs_native_operator(bucket_or_container, conf)
+        }
+    }
+
+    #[cfg(any(feature = "opendal-hdfs", feature = "opendal-hdfs-native"))]
+    fn use_hdfs_native(conf: &HashMap<String, String>) -> bool {
+        if let Some(value) = conf.get("hdfs.provider") {
+            return value.eq_ignore_ascii_case("native")
+                || value.eq_ignore_ascii_case("hdfs-native");
+        }
+
+        conf.get("hdfs.native")
+            .map(|v| {
+                v.eq_ignore_ascii_case("true")
+                    || v.eq_ignore_ascii_case("1")
+                    || v.eq_ignore_ascii_case("yes")
+                    || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(feature = "opendal-hdfs")]
+    fn create_hdfs_jvm_operator(
+        bucket_or_container: &str,
+        conf: &HashMap<String, String>,
+    ) -> FsResult<Operator> {
+        use curvine_hdfs_jni::jni::{register_jvm, JVM};
+
+        register_jvm();
+
+        let _ = JVM
+            .get_or_init()
+            .map_err(|e| FsError::common(format!("Failed to initialize JVM for HDFS: {}", e)))?;
+
+        let mut builder = Hdfs::default();
+
+        let namenode = if let Some(namenode_config) = conf.get("hdfs.namenode") {
+            namenode_config.clone()
+        } else {
+            format!("hdfs://{}", bucket_or_container)
+        };
+
+        builder = builder.name_node(&namenode);
+
+        let root_path = conf.get("hdfs.root").map(|s| s.as_str()).unwrap_or("/");
+        builder = builder.root(root_path);
+
+        let hdfs_user = conf
+            .get("hdfs.user")
+            .cloned()
+            .or_else(|| std::env::var("HADOOP_USER_NAME").ok())
+            .or_else(|| std::env::var("USER").ok());
+
+        if let Some(user) = hdfs_user {
+            builder = builder.user(&user);
+        }
+
+        if let Some(ccache) = conf.get("hdfs.kerberos.ccache") {
+            builder = builder.kerberos_ticket_cache_path(ccache);
+        } else if let Ok(ccache) = std::env::var("KRB5CCNAME") {
+            builder = builder.kerberos_ticket_cache_path(&ccache);
+        }
+
+        if let Some(krb5_conf) = conf.get("hdfs.kerberos.krb5_conf") {
+            std::env::set_var("KRB5_CONFIG", krb5_conf);
+        }
+
+        if conf
+            .get("hdfs.atomic_write_dir")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
+            let atomic_dir = format!("{}/atomic_write_dir", root_path);
+            builder = builder.atomic_write_dir(&atomic_dir);
+        }
+
+        let base_op = Operator::new(builder)
+            .map_err(|e| FsError::common(format!("Failed to create HDFS operator: {}", e)))?
+            .finish();
+
+        Self::add_stability_layers(base_op, conf)
+    }
+
+    /// Create HDFS Native operator (Rust native implementation, no JVM required)
+    ///
+    /// Note: HdfsNative uses system-level Kerberos configuration via environment variables.
+    /// Supported configurations:
+    /// - hdfs.provider: Set to "native" to select this backend when both JVM
+    ///   and native HDFS providers are compiled in
+    /// - hdfs.namenode: NameNode address (required)
+    /// - hdfs.root: Root path (default: "/")
+    /// - hdfs.kerberos.krb5_conf: Path to krb5.conf file
+    /// - hdfs.kerberos.ccache: Path to Kerberos ticket cache
+    /// - hdfs.kerberos.keytab: Path to keytab file
+    #[cfg(feature = "opendal-hdfs-native")]
+    fn create_hdfs_native_operator(
+        bucket_or_container: &str,
+        conf: &HashMap<String, String>,
+    ) -> FsResult<Operator> {
+        let namenode = if let Some(namenode_config) = conf.get("hdfs.namenode") {
+            namenode_config.clone()
+        } else {
+            format!("hdfs://{}", bucket_or_container)
+        };
+
+        let root_path = conf.get("hdfs.root").map(|s| s.as_str()).unwrap_or("/");
+
+        // Set HADOOP_USER_NAME environment variable for HDFS authentication
+        // HdfsNative reads this environment variable to determine the user
+        let hdfs_user = conf
+            .get("hdfs.user")
+            .cloned()
+            .or_else(|| std::env::var("HADOOP_USER_NAME").ok())
+            .or_else(|| std::env::var("USER").ok());
+
+        if let Some(user) = hdfs_user {
+            std::env::set_var("HADOOP_USER_NAME", &user);
+            log::debug!("Set HADOOP_USER_NAME to: {}", user);
+        }
+
+        // Configure Kerberos environment if needed
+        // HdfsNative relies on system-level Kerberos configuration:
+        // 1. Set KRB5_CONFIG environment variable (krb5.conf path)
+        // 2. Set KRB5CCNAME environment variable (ticket cache path) or use kinit
+        // 3. Optionally set KRB5_KTNAME (keytab file path)
+
+        if let Some(krb5_conf) = conf.get("hdfs.kerberos.krb5_conf") {
+            std::env::set_var("KRB5_CONFIG", krb5_conf);
+        }
+
+        if let Some(ccache) = conf.get("hdfs.kerberos.ccache") {
+            std::env::set_var("KRB5CCNAME", ccache);
+        } else if let Ok(ccache) = std::env::var("KRB5CCNAME") {
+            // Use existing KRB5CCNAME from environment
+            log::debug!("Using Kerberos ticket cache from KRB5CCNAME: {}", ccache);
+        }
+
+        if let Some(keytab) = conf.get("hdfs.kerberos.keytab") {
+            std::env::set_var("KRB5_KTNAME", keytab);
+        }
+
+        let mut builder = HdfsNative::default();
+        builder = builder.name_node(&namenode);
+        builder = builder.root(root_path);
+
+        let base_op = Operator::new(builder)
+            .map_err(|e| FsError::common(format!("Failed to create HDFS Native operator: {}", e)))?
+            .finish();
+
+        Self::add_stability_layers(base_op, conf)
+    }
+
+    fn get_object_path(&self, path: &Path) -> FsResult<String> {
+        match path.path().strip_prefix('/') {
+            Some(v) => Ok(v.to_string()),
+            None => Ok(path.path().to_string()),
+        }
+    }
+
+    fn get_dir_path(&self, path: &Path) -> FsResult<String> {
+        let object_path = self.get_object_path(path)?;
+        let dir_path = if object_path.is_empty() {
+            "/".to_string()
+        } else if object_path.ends_with(FOLDER_SUFFIX) {
+            object_path.to_string()
+        } else {
+            format!("{}{}", object_path, FOLDER_SUFFIX)
+        };
+        Ok(dir_path)
+    }
+
+    pub fn write_status(path: &Path) -> FileStatus {
+        FileStatus {
+            path: path.full_path().to_owned(),
+            name: path.name().to_owned(),
+            is_dir: false,
+            is_complete: false,
+            replicas: 1,
+            block_size: 4 * 1024 * 1024,
+            file_type: FileType::File,
+            mode: 0o777,
+            storage_policy: StoragePolicy::new_ufs(),
+            ..Default::default()
+        }
+    }
+
+    pub fn read_status(path: &Path, metadata: &Metadata) -> FileStatus {
+        let mtime = metadata
+            .last_modified()
+            .map(|t| t.into_inner().as_millisecond())
+            .unwrap_or(0);
+        let len = metadata.content_length() as i64;
+
+        FileStatus {
+            path: path.full_path().to_owned(),
+            name: path.name().to_owned(),
+            is_dir: metadata.is_dir(),
+            file_type: if metadata.is_dir() {
+                FileType::Dir
+            } else {
+                FileType::File
+            },
+            mtime,
+            len,
+            is_complete: true,
+            replicas: 1,
+            block_size: 4 * 1024 * 1024,
+            mode: 0o777,
+            storage_policy: StoragePolicy::new_ufs(),
+            ..Default::default()
+        }
+    }
+
+    async fn get_object_status(&self, object_path: &str) -> FsResult<Option<Metadata>> {
+        self.with_deadline("stat", object_path, async {
+            match self.operator.stat(object_path).await {
+                Ok(m) => Ok(Some(m)),
+                Err(e) => {
+                    if e.kind() == ErrorKind::NotFound {
+                        Ok(None)
+                    } else {
+                        err_box!(format!("failed to stat: {}", e))
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    pub async fn get_file_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
+        let (first_path, second_path) = if path.likely_file() {
+            (self.get_object_path(path)?, self.get_dir_path(path)?)
+        } else {
+            (self.get_dir_path(path)?, self.get_object_path(path)?)
+        };
+
+        let mut metadata = self.get_object_status(&first_path).await?;
+
+        if metadata.is_none() {
+            metadata = self.get_object_status(&second_path).await?;
+        }
+
+        Ok(metadata.map(|m| Self::read_status(path, &m)))
+    }
+}
+
+impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
+    fn fs_kind(&self) -> FsKind {
+        FsKind::from_scheme(&self.scheme)
+    }
+
+    // Creates a directory; the directory must end with "/".
+    // OpenDal always creates directories recursively.
+    async fn mkdir(&self, path: &Path, _create_parent: bool) -> FsResult<bool> {
+        let object_path = self.get_dir_path(path)?;
+
+        self.with_deadline("create_dir", &object_path, async {
+            self.operator
+                .create_dir(&object_path)
+                .await
+                .map_err(|e| opendal_error("Failed to create directory", &object_path, e))?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Create a new file or open for overwrite. When overwrite is false and the path exists, returns file_exists.
+    /// Empty file is written only when the path does not exist (POSIX-like); when overwrite is true we defer to the first write.
+    async fn create(&self, path: &Path, overwrite: bool) -> FsResult<OpendalWriter> {
+        let object_path = self.get_object_path(path)?;
+
+        let exist = self.get_object_status(&object_path).await?.is_some();
+
+        if exist && !overwrite {
+            return err_ext!(FsError::file_exists(path.full_path()));
+        }
+
+        if !exist {
+            // If no data is written to OpenDal, no file will be created.
+            // This does not conform to POSIX semantics, so an empty file is created.
+            self.with_deadline("create", &object_path, async {
+                self.operator
+                    .write(&object_path, opendal::Buffer::new())
+                    .await
+                    .map_err(|e| {
+                        opendal_error("Failed to create empty file", path.full_path(), e)
+                    })?;
+                Ok(())
+            })
+            .await?;
+        }
+
+        let status = Self::write_status(path);
+        Ok(OpendalWriter {
+            operator: self.operator.clone(),
+            path: path.clone(),
+            object_path,
+            status,
+            pos: 0,
+            chunk: BytesMut::with_capacity(8 * 1024 * 1024),
+            chunk_size: 8 * 1024 * 1024,
+            writer: None,
+            operation_timeout: self.operation_timeout,
+            commit_timeout: self.commit_timeout,
+            failed: None,
+        })
+    }
+
+    async fn append(&self, path: &Path) -> FsResult<OpendalWriter> {
+        // Most OpenDAL backends do not support true append; large files return unsupported.
+        // For small files we return a Writer with existing content in chunk, but write_chunk uses operator.writer() which overwrites instead of appending,
+        // so the current behavior is semantically wrong and only safe for "read existing, do not write"; real append would need read-all + concat + write in complete().
+        let object_path = self.get_object_path(path)?;
+        let status = self.get_file_status(path).await?;
+
+        match status {
+            None => err_ext!(FsError::file_not_found(path.full_path())),
+            Some(s) => {
+                if s.len < 8 * 1024 * 1024 {
+                    let chunk = self
+                        .with_deadline("append-read", path.full_path(), async {
+                            self.operator.read(&object_path).await.map_err(|e| {
+                                opendal_error(
+                                    "Failed to read existing file for append",
+                                    path.full_path(),
+                                    e,
+                                )
+                            })
+                        })
+                        .await?;
+                    return Ok(OpendalWriter {
+                        operator: self.operator.clone(),
+                        path: path.clone(),
+                        object_path,
+                        pos: s.len,
+                        status: s,
+                        chunk: BytesMut::from(chunk.to_vec().as_slice()),
+                        chunk_size: 8 * 1024 * 1024,
+                        writer: None,
+                        operation_timeout: self.operation_timeout,
+                        commit_timeout: self.commit_timeout,
+                        failed: None,
+                    });
+                }
+                err_ext!(FsError::unsupported(format!(
+                    "Append operation is not supported for file {}",
+                    path.full_path()
+                )))
+            }
+        }
+    }
+
+    async fn exists(&self, path: &Path) -> FsResult<bool> {
+        match self.get_file_status(path).await? {
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    async fn open(&self, path: &Path) -> FsResult<OpendalReader> {
+        let object_path = self.get_object_path(path)?;
+
+        let metadata = self
+            .with_deadline("open-stat", &object_path, async {
+                self.operator
+                    .stat(&object_path)
+                    .await
+                    .map_err(|e| opendal_error("Failed to stat file", &object_path, e))
+            })
+            .await?;
+        let status = Self::read_status(path, &metadata);
+
+        Ok(OpendalReader {
+            operator: self.operator.clone(),
+            path: path.clone(),
+            object_path,
+            length: status.len,
+            pos: 0,
+            chunk: DataSlice::Empty,
+            chunk_size: self.read_chunk_size,
+            concurrent: self.read_concurrent,
+            byte_stream: None,
+            status,
+            read_policy: ReadPolicy::Sequential,
+            operation_timeout: self.operation_timeout,
+        })
+    }
+
+    async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
+        if dst.is_root() {
+            return err_box!("cannot rename to root directory");
+        }
+
+        if src.full_path() == dst.full_path() {
+            return Ok(false);
+        }
+
+        let Some(src_status) = self.get_file_status(src).await? else {
+            return err_ext!(FsError::file_not_found(src.full_path()));
+        };
+
+        if src_status.is_dir {
+            let src_path = self.get_dir_path(src)?;
+            let dst_path = self.get_dir_path(dst)?;
+            self.with_deadline("rename-dir", &src_path, async {
+                if let Err(e) = self.operator.rename(&src_path, &dst_path).await {
+                    if matches!(e.kind(), ErrorKind::Unsupported | ErrorKind::IsADirectory) {
+                        return err_ext!(FsError::unsupported(
+                            "rename directory on this backend (e.g. S3)"
+                        ));
+                    }
+                    return Err(opendal_error("Failed to rename directory", &src_path, e));
+                }
+                Ok(())
+            })
+            .await?;
+        } else {
+            let src_path = self.get_object_path(src)?;
+            let dst_path = self.get_object_path(dst)?;
+            let native = self
+                .with_deadline("rename", &src_path, async {
+                    match self.operator.rename(&src_path, &dst_path).await {
+                        Ok(()) => Ok(true),
+                        Err(e) if e.kind() == ErrorKind::Unsupported => Ok(false),
+                        Err(e) => Err(opendal_error("Failed to rename file", &src_path, e)),
+                    }
+                })
+                .await?;
+            if !native {
+                // Backends without a native rename (e.g. S3) copy the whole
+                // object on the server, which takes longer for larger objects,
+                // so the copy gets `opendal.commit_timeout`. The delete that
+                // follows is a single short request.
+                with_named_deadline(
+                    OpendalConf::COMMIT_TIMEOUT,
+                    self.commit_timeout,
+                    "rename-copy",
+                    &src_path,
+                    async {
+                        self.operator
+                            .copy(&src_path, &dst_path)
+                            .await
+                            .map_err(|e| opendal_error("Failed to copy for rename", &src_path, e))
+                    },
+                )
+                .await?;
+                self.with_deadline("rename-delete", &src_path, async {
+                    self.operator.delete(&src_path).await.map_err(|e| {
+                        opendal_error("Failed to delete source for rename", &src_path, e)
+                    })
+                })
+                .await?;
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        if path.is_root() {
+            return err_box!("cannot delete root directory");
+        }
+
+        let Some(status) = self.get_file_status(path).await? else {
+            return err_ext!(FsError::file_not_found(path.full_path()));
+        };
+
+        if status.is_dir {
+            let dir_path = self.get_dir_path(path)?;
+            if recursive {
+                self.with_deadline("remove-all", &dir_path, async {
+                    self.operator
+                        .remove_all(&dir_path)
+                        .await
+                        .map_err(|e| opendal_error("Failed to remove directory", &dir_path, e))?;
+                    Ok(())
+                })
+                .await?;
+            } else {
+                let opts = opendal::options::ListOptions {
+                    limit: Some(2),
+                    ..Default::default()
+                };
+                self.with_deadline("delete-dir", &dir_path, async {
+                    let mut list = self
+                        .operator
+                        .lister_options(&dir_path, opts)
+                        .await
+                        .map_err(|e| opendal_error("Failed to list directory", &dir_path, e))?;
+
+                    // OpenDAL lists a directory together with the directory
+                    // itself (`dir/` for an empty `dir/`), so only an entry
+                    // other than `dir_path` makes it non-empty.
+                    while let Some(result) = list.next().await {
+                        // Propagate any error from listing instead of treating it as a non-empty directory.
+                        let entry = result.map_err(|e| {
+                            opendal_error("Failed to list directory entry", &dir_path, e)
+                        })?;
+                        if entry.path() != dir_path {
+                            return err_ext!(FsError::dir_not_empty(path.full_path()));
+                        }
+                    }
+                    self.operator
+                        .delete(&dir_path)
+                        .await
+                        .map_err(|e| opendal_error("Failed to delete directory", &dir_path, e))?;
+                    Ok(())
+                })
+                .await?;
+            }
+        } else {
+            let object_path = self.get_object_path(path)?;
+            self.with_deadline("delete", &object_path, async {
+                self.operator
+                    .delete(&object_path)
+                    .await
+                    .map_err(|e| opendal_error("Failed to delete file", &object_path, e))?;
+                Ok(())
+            })
+            .await?;
+        }
+
+        Ok(DeleteResult::default())
+    }
+
+    async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
+        match self.get_file_status(path).await? {
+            Some(v) => Ok(v),
+            None => err_ext!(FsError::file_not_found(path.full_path())),
+        }
+    }
+
+    async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
+        // A prefix holding millions of keys takes tens of minutes to enumerate
+        // (object stores page at ~1000 keys per request), which cannot fit in a
+        // single `opendal.operation_timeout` budget: applying one wall-clock
+        // deadline to the whole enumeration fails a listing that is making
+        // steady progress. `list_stream` bounds every page pull instead, so a
+        // busy listing runs to the end and only a stalled page trips the
+        // deadline.
+        let mut stream = self.list_stream(path, ListOptions::default()).await?;
+        stream.collect_vec().await
+    }
+
+    async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
+        err_ufs!("SetAttr operation is not supported by OpenDAL file system")
+    }
+
+    async fn list_stream(&self, path: &Path, opts: ListOptions) -> FsResult<ListStream> {
+        let fs = self.clone();
+        let path = path.clone();
+        let dir_path = fs.get_dir_path(&path)?;
+        let opts = opendal::options::ListOptions {
+            limit: opts.limit,
+            start_after: opts.start_after.map(|x| format!("{}{}", dir_path, x)),
+            ..Default::default()
+        };
+
+        let lister = fs
+            .with_deadline("list", &dir_path, async {
+                fs.operator
+                    .lister_options(&dir_path, opts)
+                    .await
+                    .map_err(|e| opendal_error("Failed to list directory", &dir_path, e))
+            })
+            .await?;
+
+        let list_dir = dir_path.clone();
+        let stream = lister
+            .map_err(move |e| opendal_error("Failed to list directory entry", &list_dir, e))
+            .try_filter_map(move |entry| {
+                let raw_path = format!(
+                    "{}://{}/{}",
+                    fs.scheme,
+                    fs.bucket_or_container,
+                    entry.path().trim_end_matches('/')
+                );
+
+                let entry_path = match Path::from_str(raw_path) {
+                    Ok(v) => v,
+                    Err(e) => return ready(Err(FsError::from(e))),
+                };
+
+                if entry_path.path() == path.path() {
+                    ready(Ok(None))
+                } else {
+                    let metadata = entry.metadata();
+                    ready(Ok(Some(Self::read_status(&entry_path, metadata))))
+                }
+            });
+
+        // The lister is lazy: each `next()` pulls the next page (a network
+        // request) once the stream is handed to the caller, so bound every pull
+        // as well instead of only the first page. A listing may legitimately run
+        // for a long time (a big prefix pages at ~1000 keys per request), so the
+        // other bound is on silence: no entry for `list_idle_timeout` means the
+        // listing is stuck, whatever its total budget would be.
+        let page_bounded =
+            bound_stream_by_deadline(Box::pin(stream), fs.operation_timeout, dir_path.clone());
+        Ok(ListStream::new(bound_stream_by_idle(
+            Box::pin(page_bounded),
+            fs.list_idle_timeout,
+            dir_path,
+        )))
+    }
+}
+
+/// Bound every `next()` of a lazy UFS stream by `timeout`.
+///
+/// A lister fetches its pages on demand, so bounding only the lister creation
+/// leaves a blackholed path able to hang the consumer mid-listing. After the
+/// first expiry the stream yields the `Timeout` error and then ends.
+fn bound_stream_by_deadline(
+    stream: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>>,
+    timeout: Duration,
+    path: String,
+) -> impl futures::Stream<Item = FsResult<FileStatus>> + Send {
+    futures::stream::unfold(Some((stream, timeout, path)), |state| async move {
+        let (mut stream, timeout, path) = state?;
+        match tokio::time::timeout(timeout, stream.next()).await {
+            Ok(Some(item)) => Some((item, Some((stream, timeout, path)))),
+            Ok(None) => None,
+            Err(elapsed) => Some((
+                Err(deadline_error(
+                    "list-next",
+                    &path,
+                    OpendalConf::OPERATION_TIMEOUT,
+                    timeout,
+                    elapsed,
+                )),
+                None,
+            )),
+        }
+    })
+}
+
+/// Fail a listing that stops producing entries for `idle`, without capping its
+/// total duration: a large prefix legitimately pages for many minutes.
+fn bound_stream_by_idle(
+    stream: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>>,
+    idle: Duration,
+    path: String,
+) -> impl futures::Stream<Item = FsResult<FileStatus>> + Send {
+    futures::stream::unfold(Some((stream, idle, path)), |state| async move {
+        let (mut stream, idle, path) = state?;
+        match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(item)) => Some((item, Some((stream, idle, path)))),
+            Ok(None) => None,
+            Err(elapsed) => Some((
+                Err(deadline_error(
+                    "list-idle",
+                    &path,
+                    OpendalConf::LIST_IDLE_TIMEOUT,
+                    idle,
+                    elapsed,
+                )),
+                None,
+            )),
+        }
+    })
+}
+
+#[cfg(test)]
+mod range_read_tests {
+    use super::*;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+
+    #[test]
+    fn random_read_recovers_to_sequential_stream() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let chunk_size = OpendalConf::DEFAULT_READ_CHUNK_SIZE;
+            let dir = std::env::temp_dir().join(format!(
+                "cv-opendal-random-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let data: Vec<u8> = (0..3 * chunk_size + 17).map(|i| (i % 251) as u8).collect();
+            std::fs::write(dir.join("range.bin"), &data).unwrap();
+
+            let operator = Operator::new(Fs::default().root(&dir.to_string_lossy()))
+                .unwrap()
+                .finish();
+            let path = Path::new("file:///range.bin").unwrap();
+            for scheme in ["oss", "s3"] {
+                let fs = OpendalFileSystem {
+                    operator: operator.clone(),
+                    scheme: scheme.to_string(),
+                    bucket_or_container: String::new(),
+                    read_chunk_size: chunk_size,
+                    read_concurrent: OpendalConf::DEFAULT_READ_CONCURRENT,
+                    operation_timeout: Duration::from_secs(30),
+                    list_idle_timeout: Duration::from_secs(600),
+                    commit_timeout: Duration::from_secs(600),
+                };
+                let mut reader = fs.open(&path).await.unwrap();
+
+                let start = chunk_size / 2;
+                let first = reader.fuse_read(start as i64, 64).await.unwrap();
+                assert_eq!(first[0].as_slice(), &data[start..start + 64]);
+                assert_eq!(reader.chunk.len() + 64, chunk_size);
+                assert!(reader.byte_stream.is_none());
+
+                let next = start + 64;
+                let chunks = reader.fuse_read(next as i64, chunk_size).await.unwrap();
+                let got: Vec<u8> = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.as_slice().iter().copied())
+                    .collect();
+                assert_eq!(got, &data[next..next + chunk_size]);
+                assert!(reader.byte_stream.is_some());
+
+                reader.complete().await.unwrap();
+
+                let mut reader = fs.open(&path).await.unwrap();
+                reader.fuse_read(0, 64).await.unwrap();
+                assert!(reader.byte_stream.is_some());
+                reader.seek(128).await.unwrap();
+                assert!(
+                    !reader.read_policy.is_random(),
+                    "seek within the buffered chunk must preserve sequential mode"
+                );
+                assert!(reader.byte_stream.is_some());
+                let got = reader.fuse_read(128, 64).await.unwrap();
+                assert_eq!(got[0].as_slice(), &data[128..192]);
+
+                let tail = data.len() - 8;
+                let got = reader.fuse_read(tail as i64, 8).await.unwrap();
+                assert_eq!(got[0].as_slice(), &data[tail..]);
+                assert!(reader
+                    .fuse_read(data.len() as i64, 1)
+                    .await
+                    .unwrap()
+                    .is_empty());
+
+                let mut short_reader = fs.open(&path).await.unwrap();
+                short_reader.length += 1;
+                let mut output = vec![0; data.len() + 1];
+                assert!(
+                    short_reader.read_full(&mut output).await.is_err(),
+                    "a stream ending before the advertised length must not be treated as EOF"
+                );
+                assert!(short_reader.byte_stream.is_none());
+
+                let mut short_random_reader = fs.open(&path).await.unwrap();
+                short_random_reader.length += 1;
+                assert!(
+                    short_random_reader
+                        .fuse_read(data.len() as i64, 1)
+                        .await
+                        .is_err(),
+                    "a short random Range must not be treated as EOF"
+                );
+                assert!(short_random_reader.read_policy.is_random());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        });
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+
+    /// OpenDAL lists a directory together with the directory itself, so that
+    /// entry must not make an empty directory look non-empty.
+    #[test]
+    fn non_recursive_delete_removes_an_empty_directory() {
+        use curvine_fs_api::FileSystem;
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "cv-opendal-delete-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("empty")).unwrap();
+            std::fs::create_dir_all(dir.join("full")).unwrap();
+            std::fs::write(dir.join("full").join("f.bin"), b"x").unwrap();
+
+            let operator = Operator::new(Fs::default().root(&dir.to_string_lossy()))
+                .unwrap()
+                .finish();
+            let fs = OpendalFileSystem {
+                operator,
+                scheme: "file".to_string(),
+                bucket_or_container: String::new(),
+                read_chunk_size: OpendalConf::DEFAULT_READ_CHUNK_SIZE,
+                read_concurrent: OpendalConf::DEFAULT_READ_CONCURRENT,
+                operation_timeout: Duration::from_secs(30),
+                list_idle_timeout: Duration::from_secs(30),
+                commit_timeout: Duration::from_secs(30),
+            };
+
+            let empty = Path::new("file:///empty").unwrap();
+            fs.delete(&empty, false).await.unwrap();
+            assert!(!dir.join("empty").exists());
+
+            // A child still makes the directory non-empty.
+            let full = Path::new("file:///full").unwrap();
+            let err = fs.delete(&full, false).await.unwrap_err();
+            assert!(matches!(err, FsError::DirNotEmpty(_)), "{err}");
+            assert!(dir.join("full").join("f.bin").exists());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use curvine_fs_api::ListStream;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+    use futures::StreamExt;
+    use std::time::Instant;
+
+    /// Regression for issue #1815: a UFS call that never returns (blackholed
+    /// object-store path) must terminate with `Timeout`, which FUSE maps to
+    /// `ETIMEDOUT`, instead of staying started forever.
+    #[test]
+    fn hung_operation_reaches_a_terminal_timeout() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let budget = Duration::from_millis(50);
+            let start = Instant::now();
+            let err = with_deadline(
+                budget,
+                "stat",
+                "s3://bucket/object",
+                std::future::pending::<FsResult<()>>(),
+            )
+            .await
+            .expect_err("a hung UFS call must not report success");
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed >= budget,
+                "returned before the deadline: {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "unbounded wait: {elapsed:?}"
+            );
+            assert!(
+                matches!(err, FsError::Timeout(_)),
+                "unexpected error: {err}"
+            );
+            assert!(
+                err.to_string().contains("opendal.operation_timeout"),
+                "timeout must name the knob to tune: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn fast_operation_keeps_its_result() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let value = with_deadline(
+                Duration::from_secs(5),
+                "stat",
+                "s3://bucket/object",
+                async { Ok(7_u32) },
+            )
+            .await
+            .expect("the inner result must be passed through");
+            assert_eq!(value, 7);
+        });
+    }
+
+    /// A lazy lister fetches pages on demand, so every pull must be bounded too.
+    #[test]
+    fn lazy_list_stream_pull_is_bounded() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let pending: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(futures::stream::pending());
+            let mut stream = ListStream::new(bound_stream_by_deadline(
+                pending,
+                Duration::from_millis(50),
+                "s3://bucket/dir/".to_string(),
+            ));
+
+            let start = Instant::now();
+            let err = stream
+                .next()
+                .await
+                .expect("the stream must yield one terminal error")
+                .expect_err("a stalled page pull must not succeed");
+            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(
+                matches!(err, FsError::Timeout(_)),
+                "unexpected error: {err}"
+            );
+
+            assert!(
+                stream.next().await.is_none(),
+                "the stream must end after the timeout instead of retrying silently"
+            );
+        });
+    }
+
+    /// The idle bound is what stops a listing that answers without ever
+    /// producing an entry: progress is measured per item, not per wall clock.
+    #[test]
+    fn an_idle_listing_fails_with_the_idle_knob() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            // One entry, then silence: the total run is short, but nothing has
+            // been produced for longer than the idle budget.
+            let pages = futures::stream::unfold(0usize, |i| async move {
+                match i {
+                    0 => Some((Ok(FileStatus::default()), 1)),
+                    _ => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Some((Ok(FileStatus::default()), i + 1))
+                    }
+                }
+            });
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(pages);
+            let mut stream = ListStream::new(bound_stream_by_idle(
+                inner,
+                Duration::from_millis(100),
+                "s3://bucket/dir/".to_string(),
+            ));
+            let first = stream.next().await.unwrap().unwrap();
+            assert_eq!(first.path, FileStatus::default().path);
+            let err = stream
+                .next()
+                .await
+                .expect("the stalled listing must end")
+                .expect_err("silence past the idle budget must fail the listing");
+            assert!(
+                matches!(err, FsError::Timeout(_)),
+                "unexpected error: {err}"
+            );
+            assert!(
+                err.to_string().contains("opendal.list_idle_timeout"),
+                "the error must name the knob to tune: {err}"
+            );
+        });
+    }
+
+    /// Entries that arrive slower than the idle budget each time are still
+    /// progress: the listing must not be failed for taking a long time.
+    #[test]
+    fn steady_entries_never_trip_the_idle_bound() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let items: Vec<FsResult<FileStatus>> = (0..10)
+                .map(|_| {
+                    Ok(FileStatus {
+                        len: 1,
+                        ..FileStatus::default()
+                    })
+                })
+                .collect();
+            let pages = futures::stream::unfold(items.into_iter(), |mut it| async move {
+                let item = it.next()?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some((item, it))
+            });
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(pages);
+            let mut stream = ListStream::new(bound_stream_by_idle(
+                inner,
+                Duration::from_millis(100),
+                "s3://bucket/dir/".to_string(),
+            ));
+            let got = stream
+                .collect_vec()
+                .await
+                .expect("steady progress must not be failed");
+            assert_eq!(got.len(), 10);
+        });
+    }
+
+    /// `list_status` is the planner's entry point and must stay the same listing
+    /// as `list_stream` (which is where the per-page bound lives): the same
+    /// entries, the same filtering of the directory itself, in the same shape.
+    ///
+    /// The timing half of the contract (a listing that outlives one operation
+    /// budget while each page fits) is covered by the stream tests below; it
+    /// cannot be reproduced on the local `fs://` backend, whose lister is
+    /// synchronous and returns thousands of entries in well under a millisecond.
+    #[test]
+    fn list_status_agrees_with_list_stream() {
+        use curvine_fs_api::FileSystem;
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "cv-opendal-list-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            for i in 0..25 {
+                std::fs::write(dir.join(format!("f{i:02}.bin")), b"x").unwrap();
+            }
+
+            let operator = Operator::new(Fs::default().root(&dir.to_string_lossy()))
+                .unwrap()
+                .finish();
+            let fs = OpendalFileSystem {
+                operator,
+                scheme: "file".to_string(),
+                bucket_or_container: String::new(),
+                read_chunk_size: OpendalConf::DEFAULT_READ_CHUNK_SIZE,
+                read_concurrent: OpendalConf::DEFAULT_READ_CONCURRENT,
+                operation_timeout: Duration::from_secs(30),
+                list_idle_timeout: Duration::from_secs(30),
+                commit_timeout: Duration::from_secs(30),
+            };
+
+            let path = Path::new("file:///").unwrap();
+            let mut stream = fs.list_stream(&path, ListOptions::default()).await.unwrap();
+            let mut from_stream: Vec<String> = stream
+                .collect_vec()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|status| status.path)
+                .collect();
+            let mut from_status: Vec<String> = fs
+                .list_status(&path)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|status| status.path)
+                .collect();
+            from_stream.sort();
+            from_status.sort();
+
+            assert_eq!(from_status, from_stream, "list_status must be its stream");
+            assert_eq!(from_status.len(), 26, "25 files plus the subdirectory");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// A listing that keeps making progress must outlive a single operation
+    /// budget: object stores page at ~1000 keys, so a large prefix legitimately
+    /// takes longer than one `opendal.operation_timeout`. `list_status` enumerates
+    /// through `list_stream`, which bounds every page pull instead of the whole
+    /// walk, so steady progress is enough (issue: a 1.7M-key prefix failed with
+    /// `list ... exceeded opendal.operation_timeout` even while listing).
+    #[test]
+    fn a_busy_listing_outlives_one_operation_budget() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let budget = Duration::from_millis(100);
+            // 20 pages, 20ms apart: ~400ms in total, well past the budget, while
+            // every single pull stays inside it.
+            let pages = futures::stream::unfold(0usize, |i| async move {
+                if i >= 20 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some((Ok(FileStatus::default()), i + 1))
+            });
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(pages);
+            let mut stream = ListStream::new(bound_stream_by_deadline(
+                inner,
+                budget,
+                "s3://bucket/dir/".to_string(),
+            ));
+            let items = stream
+                .collect_vec()
+                .await
+                .expect("a listing that keeps making progress must not time out");
+            assert_eq!(items.len(), 20);
+        });
+    }
+
+    /// The other half of the contract: a page that never arrives still trips the
+    /// deadline, so the change cannot turn a stuck listing into a hang.
+    #[test]
+    fn a_stalled_page_still_times_out() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let budget = Duration::from_millis(50);
+            let pages = futures::stream::unfold(0usize, |i| async move {
+                if i > 0 {
+                    return None;
+                }
+                std::future::pending::<()>().await;
+                Some((Ok(FileStatus::default()), i + 1))
+            });
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(pages);
+            let mut stream = ListStream::new(bound_stream_by_deadline(
+                inner,
+                budget,
+                "s3://bucket/dir/".to_string(),
+            ));
+            let err = stream
+                .collect_vec()
+                .await
+                .expect_err("a stalled page must not wait forever");
+            assert!(
+                matches!(err, FsError::Timeout(_)),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    /// A healthy lister yields all items and then ends.
+    #[test]
+    fn bounded_list_stream_passes_items_through() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let items: Vec<FsResult<FileStatus>> = vec![Ok(FileStatus::default())];
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(futures::stream::iter(items));
+            let mut stream = ListStream::new(bound_stream_by_deadline(
+                inner,
+                Duration::from_secs(5),
+                "s3://bucket/dir/".to_string(),
+            ));
+            assert!(stream.collect_vec().await.unwrap().len() == 1);
+        });
+    }
+}

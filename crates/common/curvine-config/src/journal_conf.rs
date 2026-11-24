@@ -1,0 +1,464 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::{deserialize_journal_rocksdb, ClusterConf, DBConf, RaftPeer};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_net::net::{InetAddr, NetUtils};
+use curvine_rpc::client::ClientConf;
+use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
+use curvine_runtime::runtime::Runtime;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::vec;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JournalConf {
+    // If you enable raft log synchronization, logs will not be synchronized,
+    // which is equivalent to a stand-alone system.
+    pub enable: bool,
+
+    pub group_name: String,
+    pub hostname: String,
+    pub rpc_port: u16,
+
+    pub io_threads: usize,
+    pub worker_threads: usize,
+    pub message_size: usize,
+
+    // Master candidate node
+    pub journal_addrs: Vec<RaftPeer>,
+
+    // raft log storage configuration
+    pub journal_dir: String,
+
+    // The buffer queue size when journal is written, default is 200_000
+    // The queue size is high in concurrency, which has a great impact on metadata performance. It can be set to 0 and use an unbounded queue.
+    pub writer_channel_size: usize,
+    pub writer_flush_batch_size: u64,
+    pub writer_flush_batch_ms: u64,
+
+    // Byte ceiling for one Propose frame. The op-count limit
+    // (`writer_flush_batch_size`) does not bound bytes: a single `AddBlock`
+    // carries the file's whole `blocks` vector, so 1000 ops of a big file can
+    // encode to 200+ MB and blow past the 64 MiB frame limit on the receiving
+    // end. When the accumulated encoded size reaches this ceiling the sender
+    // flushes early. 0 disables the byte budget.
+    pub writer_flush_batch_bytes: u64,
+
+    // Fold consecutive same-inode `AddBlock` ops into one journal record in
+    // the sender. Pure sender-side, no format or replay change; `false` turns
+    // it off for A/B comparison or rollback without a rebuild.
+    pub coalesce_add_block: bool,
+
+    // Follower time trigger for creating a snapshot. Entry count can also
+    // request one, but `snapshot_min_interval` still allows only one snapshot
+    // inside that window. The follower timer never fires while
+    // `snapshot_entries` is zero, since that value disables follower snapshots.
+    pub snapshot_interval: String,
+
+    // Minimum gap between snapshots on the leader and on followers.
+    // At most one snapshot is created during this interval; on the leader a
+    // failed attempt also opens the window, so retries wait for the next
+    // cycle. Zero disables the limit.
+    pub snapshot_min_interval: DurationUnit,
+
+    /// Whether the leader creates a metadata snapshot.
+    ///
+    /// The default is `None`, which is also what an omitted TOML key falls
+    /// back to: a snapshot is created only when the raft group has a single
+    /// node. Set `true` or `false` to override that for every group size.
+    ///
+    /// This switch only gates the periodic trigger. `curvine snapshot create`
+    /// still checkpoints the active master and enqueues a snapshot entry, so an
+    /// operator can compact the leader raft log while the periodic path stays
+    /// off; a multi-node group must not rely on this default in production yet.
+    /// A running master logs an error every few minutes while it is disabled.
+    ///
+    /// A checkpoint flushes RocksDB and copies the metadata store while the
+    /// metadata read lock is held, so metadata writes stall for its duration.
+    /// That write stall is the cost this switch opts out of, and the operator
+    /// path pays it on every call.
+    pub leader_create_snapshot: Option<bool>,
+
+    // How many entries are created after creating snapshots.
+    // Zero disables snapshot creation: the leader stops counting entries and a
+    // follower skips both this trigger and the `snapshot_interval` timer.
+    pub snapshot_entries: u64,
+
+    pub snapshot_read_chunk_size: usize,
+
+    // How many snapshot files are transferred at the same time when this node
+    // downloads a snapshot from its owner. Each file uses its own connection,
+    // so the value also bounds the number of download connections. 1 keeps the
+    // transfer serial; raising it speeds up large snapshots at the cost of more
+    // concurrent reads on the owner.
+    pub snapshot_download_parallel: usize,
+
+    // Network configuration between raft node communications.
+    // Set the client service connection timeout and retry policy.
+    pub conn_retry_max_duration_ms: u64,
+    pub conn_retry_min_sleep_ms: u64,
+    pub conn_retry_max_sleep_ms: u64,
+
+    // Set the read and write data timeout and retry policies.
+    pub rpc_close_idle: bool,
+
+    pub rpc_retry_max_duration_ms: u64,
+    pub rpc_retry_min_sleep_ms: u64,
+    pub rpc_retry_max_sleep_ms: u64,
+
+    // The connection timeout time is 30s by default.
+    // socket data read and write timeout time, default is 60s.
+    // It is the timeout time of a connection or request, which has a certain relationship with the time of retrying the policy.
+    pub conn_timeout_ms: u64,
+    pub io_timeout_ms: u64,
+
+    // How many connections can be used when connecting to share.
+    pub conn_size: usize,
+
+    // raft related configuration
+    pub raft_tick_interval_ms: u64,
+    pub raft_election_tick: usize,
+    pub raft_heartbeat_tick: usize,
+    pub raft_min_election_ticks: usize,
+    pub raft_max_election_ticks: usize,
+    pub raft_check_quorum: bool,
+    pub raft_max_size_per_msg: u64,
+    pub raft_max_inflight_msgs: usize,
+    pub raft_max_committed_size_per_ready: u64,
+    pub raft_batch_size: usize,
+
+    // Raft requests to retry the cache configuration to prevent duplicate requests.
+    pub raft_retry_cache_size: u64,
+    pub raft_retry_cache_ttl: String,
+
+    // The number of checkpoints saved. It also sets the raft log retention
+    // window applied when compacting: the window keeps
+    // retain_checkpoint_num * snapshot_entries log entries, so that every
+    // saved checkpoint stays replayable from the retained log (an extra
+    // recovery path that avoids snapshot transfers). 0 is rejected by
+    // validation; raising this value also grows the retained raft log, so
+    // size the journal disk accordingly.
+    pub retain_checkpoint_num: usize,
+
+    /// How strictly journal replay treats batches it cannot apply.
+    ///
+    /// Default `false`: a batch that cannot be deserialized, or an op that
+    /// fails to replay, is fatal (after retries on the leader) instead of
+    /// being skipped, so the master never silently diverges from the rest of
+    /// the raft group.
+    ///
+    /// `true`: such failures are logged and skipped, and the apply
+    /// high-water mark advances past the failed batch so replay continues.
+    /// This also drops whole batches that cannot be decoded at all, typically
+    /// written by a newer-schema leader during a rolling upgrade. Skipping is
+    /// permanent: the dropped ops are never replayed again and this master may
+    /// diverge from its peers.
+    pub ignore_reply_error: bool,
+    pub max_retry_num: u64,
+    pub skip_failed_ufs_replay_after_retry: bool,
+    pub scan_batch_size: u64,
+    pub retry_interval_secs: u64,
+
+    // Max timeout for copying data to UFS, expressed as a duration string (e.g. "20m").
+    // Default: 20 minutes.
+    pub ufs_copy_timeout: String,
+
+    /// Partial-table semantics (#1966): keys present in the TOML table
+    /// override `JournalConf::rocksdb_default()`; keys left out keep the
+    /// component default (not `DBConf::default()`). The field-level
+    /// `default` still covers the fully-absent-table case.
+    #[serde(
+        default = "JournalConf::rocksdb_default",
+        deserialize_with = "deserialize_journal_rocksdb"
+    )]
+    pub rocksdb: DBConf,
+
+    /// Raft ID of one lost HA member to explicitly rebuild from healthy peers.
+    ///
+    /// When configured, only the matching member activates recovery quarantine,
+    /// disabling elections, campaigning, and voting until durable Raft logs,
+    /// HardState, and application state have caught up with the leader.
+    ///
+    /// # Automatic Quarantine Trigger
+    /// For completely wiped members (empty local log, `last_index == 0`) or members
+    /// whose local log tail lags behind the leader's commit (`past_tail`), explicit
+    /// configuration is often unnecessary. When such a member rejoins with a new
+    /// session, receiving a leader heartbeat carrying an obsolete receiver session
+    /// automatically triggers recovery quarantine—even if the heartbeat's commit index
+    /// is 0 (provided the handshake request contains the `leader_commit` field). This
+    /// requires a healthy cluster with at least three voters and a leader supporting
+    /// the recovery handshake.
+    ///
+    /// # Recovery Marker Lifecycle
+    /// - **Detection & Activation**: When recovery quarantine is activated (either
+    ///   automatically or via `recover_from_peers`), a durable marker file
+    ///   (`member-recovery-in-progress`) recording the local Raft ID is atomically created
+    ///   and fsynced in `journal_dir`, and a durable recovery indicator (`RECOVERY_KEY`)
+    ///   is committed and WAL-flushed in local Raft metadata storage.
+    /// - **Restart Persistence & Storage Validation**: If the recovering member crashes or restarts before
+    ///   catch-up finishes, the presence of the marker file forces recovery quarantine
+    ///   to remain active, even if `recover_from_peers` has been omitted or removed from
+    ///   the configuration. If the marker was deleted or lost while recovery was incomplete,
+    ///   startup validation inspects durable storage for the persisted recovery indicator
+    ///   and fails closed on startup, preventing the node from silently participating in elections
+    ///   or voting. Ordinary nodes without recovery history (including candidates in uncommitted
+    ///   clusters) have no recovery indicator and start normally.
+    /// - **Quarantine Kept Alive at Finish**: During `finish()`, the configured marker file is
+    ///   strictly required to exist on disk (unless already unlinked in a prior attempt).
+    ///   If the marker is missing or if filesystem operations fail (`remove_file` or parent directory
+    ///   `sync_all`), the Raft node remains alive in quarantine (Policy A), logging a warning while
+    ///   keeping voting and campaigning disabled, allowing subsequent recovery ticks to retry.
+    ///   Only upon verified catch-up, successful marker unlinking, parent directory `sync_all`,
+    ///   and clearing the storage recovery indicator is recovery deactivated.
+    ///
+    /// # Safe Operator Recovery Procedure
+    /// If marker removal or synchronization fails repeatedly at runtime, or if startup fails closed
+    /// due to missing recovery metadata on an incomplete node, operators should investigate filesystem
+    /// permissions/health and either configure `recover_from_peers = <raft_id>` in the configuration
+    /// or recreate the marker file `member-recovery-in-progress` containing the local Raft ID,
+    /// allowing the node to safely re-enter quarantine and finish catch-up.
+    ///
+    /// # When Explicit Configuration Remains Necessary
+    /// Explicit `journal.recover_from_peers` remains required in scenarios where automatic
+    /// quarantine cannot safely trigger:
+    /// - When the local log is non-empty (`last_index > 0`) but stale, corrupt, or diverged
+    ///   (such as after restoring an older backup or encountering partial disk corruption),
+    ///   and the incoming heartbeat's commit index does not exceed the local tail.
+    /// - For ordinary non-obsolete sessions where persistent state was lost, which fail closed
+    ///   with an explicit error instructing the operator to configure `recover_from_peers`.
+    /// - For operator-directed, proactive member rebuilds where quarantine must be enforced
+    ///   immediately at process startup before any network RPCs are processed.
+    /// - When restarting an incomplete recovery whose marker was accidentally deleted or lost.
+    #[serde(default)]
+    pub recover_from_peers: Option<u64>,
+}
+
+impl JournalConf {
+    pub const DEFAULT_NODE_ID: u64 = 0;
+
+    /// Derives a conservative follower-read/passive-state contact deadline as
+    /// two Raft heartbeat periods. Configuration validation also requires it
+    /// to remain strictly below the minimum election timeout.
+    pub fn follower_read_contact_timeout_ms(&self) -> CommonResult<u64> {
+        let Ok(heartbeat_ticks) = u64::try_from(self.raft_heartbeat_tick) else {
+            return err_box!("journal.raft_heartbeat_tick exceeds u64");
+        };
+        if self.raft_tick_interval_ms == 0 || heartbeat_ticks == 0 {
+            return err_box!(
+                "journal Raft tick interval and heartbeat ticks must be greater than zero"
+            );
+        }
+        match self
+            .raft_tick_interval_ms
+            .checked_mul(heartbeat_ticks)
+            .and_then(|heartbeat_ms| heartbeat_ms.checked_mul(2))
+        {
+            Some(timeout_ms) => Ok(timeout_ms),
+            None => err_box!("journal follower readiness contact timeout overflows u64"),
+        }
+    }
+
+    /// Returns the shortest effective election timeout, including raft-rs's
+    /// `min_election_tick == 0` fallback to `election_tick`. Arithmetic is
+    /// checked rather than allowing extreme values to wrap into a deadline.
+    pub fn minimum_election_timeout_ms(&self) -> CommonResult<u64> {
+        let configured_minimum = if self.raft_min_election_ticks == 0 {
+            self.raft_election_tick
+        } else {
+            self.raft_min_election_ticks
+        };
+        let Ok(min_election_ticks) = u64::try_from(configured_minimum) else {
+            return err_box!("journal effective minimum election ticks exceeds u64");
+        };
+        if self.raft_tick_interval_ms == 0 || min_election_ticks == 0 {
+            return err_box!(
+                "journal Raft tick interval and effective minimum election ticks must be greater than zero"
+            );
+        }
+        match self.raft_tick_interval_ms.checked_mul(min_election_ticks) {
+            Some(timeout_ms) => Ok(timeout_ms),
+            None => err_box!("journal minimum election timeout overflows u64"),
+        }
+    }
+
+    // Create a test configuration, which will also randomly select a server port.
+    pub fn with_test() -> Self {
+        let mut conf = Self::default();
+        let port = NetUtils::get_available_port();
+        conf.rpc_port = port;
+        conf.journal_addrs = vec![RaftPeer::from_addr(&conf.hostname, port)];
+        conf
+    }
+
+    pub fn rocksdb_default() -> DBConf {
+        DBConf {
+            disable_wal: false,
+            block_size: ByteUnit::kb(16),
+            use_bloom_filter: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn create_runtime(&self) -> Arc<Runtime> {
+        let rt = Runtime::new("raft-rpc", self.io_threads, self.worker_threads);
+        Arc::new(rt)
+    }
+
+    /// Durable marker retained until a lost member has safely rejoined Raft.
+    pub fn recovery_marker(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.journal_dir).join("member-recovery-in-progress")
+    }
+
+    pub fn local_addr(&self) -> InetAddr {
+        InetAddr::new(self.hostname.clone(), self.rpc_port)
+    }
+
+    pub fn db_conf(&self) -> DBConf {
+        self.rocksdb.clone().set_dir(&self.journal_dir)
+    }
+
+    /// Leader snapshots follow `leader_create_snapshot` when it is set.
+    /// Otherwise a single raft node creates them and a larger group does not.
+    pub fn leader_creates_snapshot(&self) -> bool {
+        self.leader_create_snapshot
+            .unwrap_or(self.journal_addrs.len() == 1)
+    }
+
+    pub fn new_client_conf(&self) -> ClientConf {
+        ClientConf {
+            io_threads: self.io_threads,
+            worker_threads: self.worker_threads,
+            message_size: self.message_size,
+
+            conn_retry_max_duration_ms: self.conn_retry_max_duration_ms,
+            conn_retry_min_sleep_ms: self.conn_retry_min_sleep_ms,
+            conn_retry_max_sleep_ms: self.conn_retry_max_sleep_ms,
+
+            io_retry_max_duration_ms: self.rpc_retry_max_duration_ms,
+            io_retry_min_sleep_ms: self.rpc_retry_min_sleep_ms,
+            io_retry_max_sleep_ms: self.rpc_retry_max_sleep_ms,
+
+            close_idle: self.rpc_close_idle,
+
+            conn_timeout_ms: self.conn_timeout_ms,
+            rpc_timeout_ms: self.io_timeout_ms,
+            data_timeout_ms: self.io_timeout_ms,
+
+            conn_size: self.conn_size,
+
+            use_libc: false,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for JournalConf {
+    fn default() -> Self {
+        let journal_dir = format!("testing/journal-{}", Utils::rand_id());
+        let journal_addrs = vec![RaftPeer::new(
+            1,
+            ClusterConf::DEFAULT_HOSTNAME,
+            ClusterConf::DEFAULT_RAFT_PORT,
+        )];
+
+        let rocksdb = Self::rocksdb_default().set_dir(journal_dir.as_str());
+        Self {
+            enable: true,
+            group_name: "raft-group".to_string(),
+            hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
+            rpc_port: ClusterConf::DEFAULT_RAFT_PORT,
+            io_threads: 8,
+            worker_threads: 8,
+            message_size: 200,
+            journal_addrs,
+            journal_dir,
+            writer_channel_size: 0,
+            writer_flush_batch_size: 1000,
+            writer_flush_batch_ms: 10,
+            writer_flush_batch_bytes: 4 * 1024 * 1024,
+            coalesce_add_block: true,
+            snapshot_interval: "6h".to_string(),
+            snapshot_min_interval: DurationUnit::new(10 * DurationUnit::MINUTE),
+            leader_create_snapshot: None,
+            snapshot_entries: 1_000_000,
+            snapshot_read_chunk_size: 1024 * 1024,
+            snapshot_download_parallel: 8,
+
+            conn_retry_max_duration_ms: 0,
+            conn_retry_min_sleep_ms: 10 * 1000,
+            conn_retry_max_sleep_ms: 10 * 1000,
+
+            rpc_close_idle: false,
+            rpc_retry_max_duration_ms: 60 * 1000,
+            rpc_retry_min_sleep_ms: 100,
+            rpc_retry_max_sleep_ms: 3 * 1000,
+
+            conn_timeout_ms: 30 * 1000,
+            io_timeout_ms: 60 * 1000,
+
+            conn_size: 1,
+
+            raft_tick_interval_ms: 1000,
+            raft_election_tick: 10,
+            raft_heartbeat_tick: 3,
+            raft_min_election_ticks: 10,
+            raft_max_election_ticks: 30,
+            raft_check_quorum: true,
+            raft_max_size_per_msg: 1024 * 1024,
+            raft_max_inflight_msgs: 256,
+            raft_max_committed_size_per_ready: 16 * 1024 * 1024,
+            raft_batch_size: 8,
+
+            raft_retry_cache_size: 100_000,
+            raft_retry_cache_ttl: "10m".to_string(),
+
+            retain_checkpoint_num: 3,
+
+            ignore_reply_error: false,
+            max_retry_num: 1000,
+            skip_failed_ufs_replay_after_retry: true,
+            scan_batch_size: 1000,
+            retry_interval_secs: 10,
+            ufs_copy_timeout: "20m".to_owned(), // 20 minutes
+
+            rocksdb,
+            recover_from_peers: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JournalConf;
+    use curvine_runtime::common::ByteUnit;
+
+    #[test]
+    fn partial_rocksdb_table_keeps_component_defaults() {
+        // #1966: a partial [journal.rocksdb] table must overlay the component
+        // baseline, not the generic DBConf::default().
+        let raw = r#"
+            scan_batch_size = 500
+            [rocksdb]
+            block_size = "32KB"
+        "#;
+        let conf: JournalConf = toml::from_str(raw).unwrap();
+
+        assert_eq!(conf.rocksdb.block_size, ByteUnit::kb(32));
+        assert!(conf.rocksdb.use_bloom_filter);
+        assert!(!conf.rocksdb.disable_wal);
+        assert_eq!(conf.scan_batch_size, 500);
+    }
+}

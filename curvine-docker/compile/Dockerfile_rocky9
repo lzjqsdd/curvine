@@ -5,15 +5,25 @@ FROM rockylinux:9
 ARG REPO_URL=https://github.com/curvineio/curvine
 LABEL org.opencontainers.image.source="${REPO_URL}"
 
+ARG SPDK_VERSION=v25.09
+ARG NASM_VERSION=2.16.03
+ARG ISAL_VERSION=v2.31.1
+
 # 1. Install the basic toolchain and dependencies
 # rockylinux:9 ships curl-minimal; installing package "curl" conflicts with it. curl-minimal is enough for HTTPS downloads below.
 RUN dnf install -y dnf-plugins-core && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
+    epel-release \
     gcc \
     gcc-c++ \
     make \
     pkg-config \
+    numactl-devel \
+    libuuid-devel \
+    rdma-core-devel \
+    libibverbs-devel \
+    librdmacm-devel \
     fuse3 \
     fuse3-devel \
     clang \
@@ -52,14 +62,40 @@ RUN curl -sL https://rpm.nodesource.com/setup_22.x | bash - && \
     dnf install -y --nobest nodejs && \
     dnf clean all
 
+# 1.2. Install FoundationDB client library (multi-arch)
+# Required to link libfdb_c when building curvine-mds/curvine-server
+# (foundationdb crate, fdb-7_3). The official release ships x86_64 as el7
+# and aarch64 as el9 rpms; both are compatible with Rocky 9. SHA256-pinned
+# for supply-chain safety (same pin as the CI workflow used previously).
+RUN ARCH=$(uname -m) && \
+    FDB_VERSION=7.3.77 && \
+    case "${ARCH}" in \
+        x86_64) \
+            FDB_PACKAGE="foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm" && \
+            FDB_SHA256="9255a4730655ac1a8461d8da5148a9d87c8978944188477f5b745318bb6d40ba" ;; \
+        aarch64) \
+            FDB_PACKAGE="foundationdb-clients-${FDB_VERSION}-1.el9.aarch64.rpm" && \
+            FDB_SHA256="b6980a23c23c61dea08d8f665395593a7b2972fac04d0cb822d9a42c7202efa6" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing FoundationDB client ${FDB_VERSION} for ${ARCH}..." && \
+    curl -fsSL -o /tmp/${FDB_PACKAGE} \
+        "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/${FDB_PACKAGE}" && \
+    echo "${FDB_SHA256}  /tmp/${FDB_PACKAGE}" | sha256sum -c - && \
+    rpm -i --nodeps /tmp/${FDB_PACKAGE} && \
+    rm -f /tmp/${FDB_PACKAGE} && \
+    ldconfig && \
+    ls -l /usr/lib64/libfdb_c.so && \
+    echo "✓ FoundationDB client installed successfully for ${ARCH}"
+
 # 2. Install the Rust toolchain
 # uncomment the following two lines if you met network problem
 #ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
 #ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0 && \
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98 && \
     source $HOME/.cargo/env && \
-    rustup default 1.92.0
+    rustup default 1.98
 
 # 2.1. Install cargo-nextest for fast test runs (used by CI and regression script)
 RUN cargo install cargo-nextest --locked
@@ -83,9 +119,11 @@ ENV PATH="/app/protoc/bin:${PATH}"
 
 # 4. Install Maven
 RUN cd /app && \
-    MAVEN_VERSION=3.9.15 && \
-    curl -fL -o apache-maven-${MAVEN_VERSION}-bin.tar.gz https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
-    tar -xzf apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    MAVEN_VERSION=3.9.16 && \
+    MAVEN_PACKAGE=apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    MAVEN_ARCHIVE_URL=https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${MAVEN_PACKAGE} && \
+    curl -fL -o ${MAVEN_PACKAGE} ${MAVEN_ARCHIVE_URL} && \
+    tar -xzf ${MAVEN_PACKAGE} && \
     mv apache-maven-${MAVEN_VERSION} maven && \
     rm -f *.tar.gz && \
     echo "✓ Maven ${MAVEN_VERSION} installed successfully"
@@ -119,6 +157,68 @@ RUN cd /opt && \
     echo "✓ JindoSDK ${JINDOSDK_VERSION} installed successfully for ${ARCH}"
 ENV JINDOSDK_HOME=/opt/jindosdk
 ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib"
+
+# 4.2. Build SPDK once in the compile image. Runtime and test images consume
+# /opt/spdk from this image instead of rebuilding SPDK in deploy Dockerfiles.
+RUN cd /tmp && \
+    git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git spdk-src && \
+    cd spdk-src && \
+    git submodule update --init --depth 1 && \
+    dnf config-manager --set-disabled devel 2>/dev/null || true && \
+    scripts/pkgdep.sh --rdma && \
+    dnf clean all && \
+    curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
+        tar -xz -C /tmp && \
+    cd /tmp/nasm-$NASM_VERSION && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    cd /tmp && \
+    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
+    cd isa-l-src && \
+    ./autogen.sh && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd /tmp/spdk-src && \
+    ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) TARGET_ARCH="nehalem" ;; \
+        aarch64) TARGET_ARCH="native" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    ./configure \
+        --disable-tests \
+        --with-rdma \
+        --without-vfio-user \
+        --target-arch=${TARGET_ARCH} \
+        --with-shared && \
+    make -j$(nproc) && \
+    mkdir -p /opt/spdk/build/bin \
+             /opt/spdk/build/lib \
+             /opt/spdk/dpdk/build/lib \
+             /opt/spdk/include/spdk \
+             /opt/spdk/dpdk/build/include \
+             /opt/spdk/isa-l/.libs \
+             /opt/spdk/isa-l-crypto/.libs && \
+    cp build/bin/nvmf_tgt /opt/spdk/build/bin/ && \
+    cp build/lib/libspdk*.so* /opt/spdk/build/lib/ && \
+    cp build/lib/libspdk*.a /opt/spdk/build/lib/ && \
+    cp dpdk/build/lib/librte_*.so* /opt/spdk/dpdk/build/lib/ && \
+    cp dpdk/build/lib/librte_*.a /opt/spdk/dpdk/build/lib/ && \
+    cp -r include/spdk/*.h /opt/spdk/include/spdk/ && \
+    cp -r dpdk/build/include/* /opt/spdk/dpdk/build/include/ && \
+    cp -r scripts /opt/spdk/scripts && \
+    cp -r python /opt/spdk/python && \
+    cp isa-l/.libs/libisal* /opt/spdk/isa-l/.libs/ && \
+    cp isa-l-crypto/.libs/libisal* /opt/spdk/isa-l-crypto/.libs/ && \
+    ldconfig && \
+    rm -rf /tmp/spdk-src /tmp/nasm-$NASM_VERSION /tmp/isa-l-src
+
+ENV SPDK_DIR=/opt/spdk
+ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
+ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/build/lib:/opt/spdk/isa-l/.libs:/opt/spdk/isa-l-crypto/.libs:${JINDOSDK_HOME}/lib"
 
 # 5. Install Go toolchain with multi-arch support
 RUN ARCH=$(uname -m) && \
@@ -162,6 +262,8 @@ WORKDIR /workspace
 # Verify toolchains. Do not `npm install -g npm@latest`: it replaces distro npm and can leave broken deps (e.g. MODULE_NOT_FOUND promise-retry).
 RUN rustc --version && cargo --version && protoc --version && mvn --version && node --version && \
     npm --version && \
+    test -f /opt/spdk/build/lib/libspdk_nvme.a && \
+    test -f /opt/spdk/build/bin/nvmf_tgt && \
     go version
 
 # Use ENTRYPOINT to ensure environment is loaded

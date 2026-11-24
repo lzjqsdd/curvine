@@ -10,10 +10,16 @@ on:
       - '**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Tune build parallelism: 4 uses more CPU on standard 4-vCPU runner; set to 2 if OOM
   CARGO_BUILD_JOBS: 4
+  CVTEST_REPO: CurvineIO/cvtest
+  CVTEST_REF: 5d7ea3052e7a812289d1a8e57aeddda0cb7af425
+  MOUNT_PATH: /curvine-fuse
 
 jobs:
   # Speed note: slowness is from runner CPU/RAM (standard = 4 vCPU, ~16GB), not container size.
@@ -37,12 +43,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: cleanup
-    # curvine-tests image extends curvine-compile:rocky9 and pre-installs Flask, werkzeug, pip, jq, fio (see curvine-tests/Dockerfile)
+    timeout-minutes: 90
+    # curvine-tests extends curvine-compile:rocky9 and includes the build tools,
+    # FUSE userspace packages, and pinned LTP used by the PR POSIX smoke test.
     container:
       image: ghcr.io/curvineio/curvine-tests:rocky9
+      options: --privileged --device /dev/fuse
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       
       - name: Setup Rust toolchain
         run: |
@@ -52,9 +61,9 @@ jobs:
           rustup default stable
           rustc --version
           cargo --version
-      
+
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "curvine-build"
           cache-all-crates: false
@@ -68,6 +77,16 @@ jobs:
           
           echo "After fmt, disk usage:"
           df -h
+
+      - name: Dependency boundary guardrails
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make check-client-deps
+
+      - name: API crate dependency boundary check
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make check-api-crate-deps
         
       - name: Run clippy
         env:
@@ -76,6 +95,9 @@ jobs:
           echo "Running clippy (static code analysis)"
           # Run clippy in debug mode to match build
           cargo clippy --all-targets --jobs ${{ env.CARGO_BUILD_JOBS }} -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
+
+          echo "Running etcd service discovery clippy"
+          cargo clippy -p curvine-service-discovery --features etcd --tests --jobs ${{ env.CARGO_BUILD_JOBS }} -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
           
           echo "After clippy, disk usage:"
           df -h
@@ -94,9 +116,210 @@ jobs:
           df -h
           
           cargo build --verbose --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo build -p curvine-service-discovery --features etcd --tests --verbose --jobs ${{ env.CARGO_BUILD_JOBS }}
           
           echo "After build, disk usage:"
           df -h
+
+      - name: Run etcd service discovery tests
+        run: |
+          echo "Running feature-gated etcd service discovery unit tests"
+          cargo test -p curvine-service-discovery --features etcd --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After etcd service discovery tests, disk usage:"
+          df -h
+
+      - name: Follower reads with static master addresses
+        run: |
+          cargo test -p curvine-server --test follower_runtime_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
+      # This suite is the only merge gate for the no-snapshot metadata rebuild;
+      # without this step it runs only in the daily coverage workflow. Serial
+      # execution keeps the restart cases from contending on the RocksDB lock.
+      - name: Journal rebuild consistency tests
+        run: |
+          cargo test -p curvine-server --test journal_consistency_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
+          echo "After journal consistency tests, disk usage:"
+          df -h
+
+      # `clippy --all-targets` only compiles these tests, so without this step
+      # they run only in the daily coverage workflow.
+      - name: Run curvine-runtime and curvine-transfer-client unit tests
+        run: |
+          cargo test -p curvine-runtime -p curvine-transfer-client --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+      # The `transfer` module of curvine-data-transfer is behind a feature, so a
+      # plain `cargo test -p curvine-data-transfer` only runs the worker tests
+      # and would let a regression in the scheduler/planner/store land green.
+      - name: Run curvine-data-transfer transfer unit tests
+        run: |
+          cargo test -p curvine-data-transfer --features transfer --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+      # The master's own tests (namespace, trash, delete, metrics)
+      # otherwise run only in the daily coverage workflow.
+      #
+      # The two TTL scheduler tests named below fail about one run in five at
+      # the default thread count (#2290), so they are skipped here and keep
+      # running in the daily job; drop the `--skip` lines once #2290 is fixed.
+      - name: Run curvine-master tests
+        run: |
+          cargo test -p curvine-master --jobs ${{ env.CARGO_BUILD_JOBS }} -- \
+            --skip ttl_scheduler::tests::standby_skips_scheduled_ttl_cleanup_and_resumes_after_promotion \
+            --skip ttl_scheduler::tests::non_active_cleanup_requeues_inodes_until_promotion
+
+          echo "After curvine-master tests, disk usage:"
+          df -h
+      # `clippy --all-targets` only compiles these tests. Without this step an
+      # auth or multipart regression in the gateway would land green and only
+      # surface in the daily coverage workflow.
+      - name: Run S3 gateway unit tests
+        run: |
+          echo "Running curvine-s3-gateway unit tests"
+          cargo test -p curvine-s3-gateway --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After S3 gateway tests, disk usage:"
+          df -h
+
+      # `clippy --all-targets` only compiles these tests. Without this step a
+      # mount command regression (arg parsing, masking, detail rendering)
+      # would land green and only surface in the daily coverage workflow.
+      - name: Run curvine-cli unit tests
+        run: |
+          echo "Running curvine-cli unit tests"
+          cargo test -p curvine-cli --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After curvine-cli tests, disk usage:"
+          df -h
+
+      # `cargo test` over the whole workspace (the daily coverage workflow)
+      # links this crate's unit-test harness without the `oss-hdfs` feature,
+      # so without JindoSDK. Linking it here keeps that from breaking again.
+      - name: Link curvine-ufs-oss-hdfs without JindoSDK
+        run: |
+          cargo test -p curvine-ufs-oss-hdfs --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+      - name: S3 UFS credential tests
+        run: |
+          # S3OperatorSettings and tests/s3_sts_wire.rs live behind `opendal-s3`, which the default
+          # build never enables, so without this step dropping the session token from the operator
+          # builder would keep every gate green. The wire test targets a loopback S3 stand-in and
+          # the pre-existing s3_fs.rs self-skips without credentials, so no cloud access is needed.
+          cargo test -p curvine-ufs-api --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo test -p curvine-ufs-opendal --features opendal-s3 --tests --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After S3 UFS credential tests, disk usage:"
+          df -h
+
+      - name: Replication lifecycle regression tests
+        run: |
+          # Exercise the real Master/Worker submit, dropped-report, reaper and
+          # destination-fencing chain; these tests require the explicit feature.
+          cargo test -p curvine-tests --features fault-injection --test replication_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
+      # These check the launch scripts and packaging helpers against stub
+      # binaries, so they need no cluster; no other workflow ran them. The
+      # release-version scripts already run in prepare-release.yml.
+      # test_restart_all_stop.sh is left out: restart-all.sh finds services
+      # with `ps -ef`, and this image has no procps.
+      - name: Launch and packaging script tests
+        run: |
+          for name in launch_process_start systemd_units curvine_fuse package_version; do
+            echo "== build/tests/test_${name}.sh"
+            bash "build/tests/test_${name}.sh"
+          done
+
+      - name: Minimal client artifact dependency guardrails
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make check-minimal-artifact-deps
+
+      - name: Checkout cvtest for POSIX smoke
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.CVTEST_REPO }}
+          ref: ${{ env.CVTEST_REF }}
+          path: cvtest
+
+      - name: Assemble POSIX smoke distribution from existing build
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          test -x target/debug/curvine-server
+          test -x target/debug/curvine-fuse
+          test -x /opt/ltp/runltp
+
+          rm -rf build/dist
+          mkdir -p build/dist/bin build/dist/conf build/dist/lib
+          cp -a build/bin/. build/dist/bin/
+          cp -a etc/. build/dist/conf/
+          install -m 0755 target/debug/curvine-server build/dist/lib/curvine-server
+          install -m 0755 target/debug/curvine-fuse build/dist/lib/curvine-fuse
+          chmod +x build/dist/bin/*
+
+      - name: Start cluster and mount FUSE for POSIX smoke
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p "$MOUNT_PATH"
+          cd build/dist
+          ./bin/local-cluster.sh restart force
+          ./bin/curvine-fuse.sh restart -d
+          python3 - <<'EOF'
+          import os, time, sys
+          mnt = os.environ["MOUNT_PATH"]
+          p = os.path.join(mnt, ".ci-ready")
+          payload = b"ci" * 8192
+          deadline = time.time() + 120
+          last_error = None
+          while time.time() < deadline:
+              try:
+                  # curvine-fuse.sh returns before the FUSE mount exists; a write
+                  # into the bare directory would pass without proving that a
+                  # worker has registered and the data path is usable.
+                  if not os.path.ismount(mnt):
+                      raise OSError(f"{mnt} is not mounted yet")
+                  with open(p, "wb") as f:
+                      f.write(payload)
+                  with open(p, "rb") as f:
+                      assert f.read() == payload
+                  os.unlink(p)
+                  sys.exit(0)
+              except OSError as exc:
+                  last_error = exc
+                  time.sleep(2)
+          print(f"data path not ready after 120s: {last_error}", file=sys.stderr)
+          sys.exit(1)
+          EOF
+
+      - name: Run focused POSIX smoke
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p ltp-results
+
+          suite="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
+            cvtest/suites/ci-fast.txt)"
+          if [ "$suite" != "ltp:posix-cv-smoke" ]; then
+            echo "Expected ci-fast.txt to contain only ltp:posix-cv-smoke, found:" >&2
+            printf '%s\n' "$suite" >&2
+            exit 1
+          fi
+
+          ./cvtest/cvtest run --suite "$suite" --mount "$MOUNT_PATH" \
+            --json "$GITHUB_WORKSPACE/ltp-results/ltp-posix-cv-smoke.json" \
+            --log "$GITHUB_WORKSPACE/ltp-results/ltp-posix-cv-smoke.log"
+
+      - name: Print LTP diagnostics
+        if: ${{ failure() && github.event_name == 'pull_request' }}
+        run: |
+          for log_file in build/dist/logs/*.out ltp-results/*.log; do
+            if [ -f "$log_file" ]; then
+              echo "===== ${log_file} ====="
+              tail -n 200 "$log_file"
+            fi
+          done
 
       # - name: Run unit tests (skip UFS-dependent tests in CI)
       #   env:
@@ -114,6 +337,7 @@ jobs:
         # On failure, summary is written to GitHub Step Summary; step exits non-zero so pipeline fails.
 
       - name: Final cleanup before cache save
+        if: always()
         run: |
           echo "Final cleanup before cache save"
           

@@ -30,8 +30,15 @@ CURVINE_HOME="$(cd "$BIN_DIR/.."; pwd)"
 SERVICES=("master" "worker")
 
 # Define log directory
-LOG_DIR="$CURVINE_HOME/logs"
+LOG_DIR="${CURVINE_LOG_DIR:-$CURVINE_HOME/logs}"
 mkdir -p "$LOG_DIR"
+
+# Upgrade compatibility: older versions kept pid files directly under
+# CURVINE_HOME. Move them into LOG_DIR so stop/status keep working.
+for f in "$CURVINE_HOME"/*.pid; do
+  [ -f "$f" ] || continue
+  mv "$f" "$LOG_DIR/"
+done
 
 # Define color
 GREEN="\033[0;32m"
@@ -55,7 +62,7 @@ print_error() {
 # Check service status
 check_service_status() {
     local service=$1
-    local pid_file="$CURVINE_HOME/${service}.pid"
+    local pid_file="$LOG_DIR/${service}.pid"
     
     if [ -f "$pid_file" ]; then
         local pid=$(cat "$pid_file")
@@ -72,15 +79,160 @@ check_service_status() {
     fi
 }
 
+read_rpc_port() {
+    local section=$1
+    local default_port=$2
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-cluster.toml}"
+
+    if [ ! -f "$conf_file" ]; then
+        echo "$default_port"
+        return
+    fi
+
+    awk -v section="[$section]" -v default_port="$default_port" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == section)
+        }
+        in_section && /^[[:space:]]*rpc_port[[:space:]]*=/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/^[^=]*=/, "", line)
+            gsub(/[[:space:]"]/, "", line)
+            if (line != "") {
+                print line
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print default_port
+            }
+        }
+    ' "$conf_file"
+}
+
+wait_service_ready() {
+    local service=$1
+    local port=$2
+    local timeout=${3:-60}
+    local elapsed=0
+    local pid_file="$LOG_DIR/${service}.pid"
+
+    print_info "Waiting for $service RPC port $port to become ready..."
+    while [ $elapsed -lt $timeout ]; do
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file")
+            if ! kill -0 "$pid" > /dev/null 2>&1; then
+                print_error "$service exited before RPC port $port became ready"
+                tail -80 "$LOG_DIR/${service}.out" 2>/dev/null || true
+                return 1
+            fi
+        fi
+
+        if command -v nc >/dev/null 2>&1; then
+            if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+                print_info "$service RPC port $port is ready"
+                return 0
+            fi
+        elif command -v ss >/dev/null 2>&1; then
+            if ss -ltn "( sport = :$port )" | grep -q ":$port"; then
+                print_info "$service RPC port $port is ready"
+                return 0
+            fi
+        else
+            print_warn "Neither nc nor ss is available; only process start was verified"
+            return 0
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    print_error "$service RPC port $port was not ready after ${timeout}s"
+    tail -80 "$LOG_DIR/${service}.out" 2>/dev/null || true
+    return 1
+}
+
+# Print a scalar `key = value` from the given [section] with whitespace and
+# quotes stripped, or default_value when the key (or the file) is absent.
+read_str() {
+    local section=$1
+    local key=$2
+    local default_value=$3
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-cluster.toml}"
+
+    if [ ! -f "$conf_file" ]; then
+        echo "$default_value"
+        return
+    fi
+
+    awk -v section="[$section]" -v key="$key" -v default_value="$default_value" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == section)
+        }
+        in_section {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]\"]/, "", line)
+            if (line ~ "^" key "=") {
+                sub(/^[^=]*=/, "", line)
+                print line
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print default_value
+            }
+        }
+    ' "$conf_file"
+}
+
+# The transfer service runs embedded inside the master by default and needs no
+# extra process. Only the standalone deployment gets one, selected either
+# explicitly with `transfer.mode = "standalone"` or implicitly by a non-empty
+# `transfer.endpoints` list.
+transfer_standalone() {
+    local mode endpoints
+
+    mode="$(read_str "transfer" "mode" "")"
+    if [ "$mode" = "standalone" ]; then
+        return 0
+    fi
+
+    endpoints="$(read_str "transfer" "endpoints" "")"
+    if [ -z "$endpoints" ] || [ "$endpoints" = "[]" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+active_services() {
+    local services=("${SERVICES[@]}")
+    if transfer_standalone || [ -f "$LOG_DIR/transfer.pid" ]; then
+        services+=("transfer")
+    fi
+    echo "${services[@]}"
+}
+
 # Start all services
 start_all() {
     print_info "Starting Curvine local cluster..."
     
     # Check if there is already a service running
     local running=false
-    for service in "${SERVICES[@]}"; do
-        if [ -f "$CURVINE_HOME/${service}.pid" ]; then
-            local pid=$(cat "$CURVINE_HOME/${service}.pid")
+    for service in $(active_services); do
+        if [ -f "$LOG_DIR/${service}.pid" ]; then
+            local pid=$(cat "$LOG_DIR/${service}.pid")
             if kill -0 "$pid" > /dev/null 2>&1; then
                 print_warn "$service is already running (PID: $pid)"
                 running=true
@@ -93,12 +245,23 @@ start_all() {
         return 1
     fi
     
-    # Start each service
-    for service in "${SERVICES[@]}"; do
-        print_info "Starting $service..."
-        "$BIN_DIR/curvine-${service}.sh" start
-        sleep 2
-    done
+    local master_port=$(read_rpc_port "master" 8995)
+    local worker_port=$(read_rpc_port "worker" 8997)
+    local transfer_port=$(read_rpc_port "transfer" 9010)
+
+    print_info "Starting master..."
+    "$BIN_DIR/curvine-master.sh" start
+    wait_service_ready "master" "$master_port" 180 || return 1
+
+    print_info "Starting worker..."
+    "$BIN_DIR/curvine-worker.sh" start
+    wait_service_ready "worker" "$worker_port" 60 || return 1
+
+    if transfer_standalone; then
+        print_info "Starting transfer..."
+        "$BIN_DIR/curvine-transfer.sh" start
+        wait_service_ready "transfer" "$transfer_port" 60 || return 1
+    fi
     
     print_info "All services started. Use 'status' to check cluster status."
 }
@@ -108,8 +271,9 @@ stop_all() {
     print_info "Stopping Curvine local cluster..."
     
     # Stop service in reverse order
-    for (( idx=${#SERVICES[@]}-1 ; idx>=0 ; idx--)) ; do
-        service="${SERVICES[idx]}"
+    local services=($(active_services))
+    for (( idx=${#services[@]}-1 ; idx>=0 ; idx--)) ; do
+        service="${services[idx]}"
         print_info "Stopping $service..."
         "$BIN_DIR/curvine-${service}.sh" stop
         sleep 1
@@ -117,9 +281,9 @@ stop_all() {
     
     # Check if any service is still running
     local still_running=false
-    for service in "${SERVICES[@]}"; do
-        if [ -f "$CURVINE_HOME/${service}.pid" ]; then
-            local pid=$(cat "$CURVINE_HOME/${service}.pid")
+    for service in "${services[@]}"; do
+        if [ -f "$LOG_DIR/${service}.pid" ]; then
+            local pid=$(cat "$LOG_DIR/${service}.pid")
             if kill -0 "$pid" > /dev/null 2>&1; then
                 print_warn "$service is still running (PID: $pid)"
                 Still_running=true
@@ -130,9 +294,9 @@ stop_all() {
     if [ "$still_running" = true ] && [ "$1" = "force" ]; then
         print_warn "Force killing remaining processes..."
         pkill -9 -f "curvine"
-        for service in "${SERVICES[@]}"; do
-            if [ -f "$CURVINE_HOME/${service}.pid" ]; then
-                rm -f "$CURVINE_HOME/${service}.pid"
+        for service in "${services[@]}"; do
+            if [ -f "$LOG_DIR/${service}.pid" ]; then
+                rm -f "$LOG_DIR/${service}.pid"
             fi
         done
     fi
@@ -152,9 +316,10 @@ restart_all() {
 show_status() {
     print_info "Curvine local cluster status:"
     echo "-----------------------------------"
+    local services=($(active_services))
     
     local all_running=true
-    for service in "${SERVICES[@]}"; do
+    for service in "${services[@]}"; do
         echo -n "$service: "
         if ! check_service_status "$service"; then
             all_running=false

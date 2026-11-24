@@ -1,0 +1,140 @@
+syntax="proto2";
+package raft;
+
+import "eraftpb.proto";
+
+
+// Represents a snapshot file.
+message SnapshotFileInfo {
+    required string path = 1;
+    required uint64 mtime = 2;
+    required uint64 ctime = 3;
+    required uint64 len = 4;
+}
+
+// List of snapshot files
+message SnapshotFileList {
+    // Snapshot root path
+    required string dir = 1;
+
+    // Snapshot all file list
+    repeated SnapshotFileInfo files = 2;
+}
+
+message AppliedIndex {
+    required uint64 term = 1;
+    required uint64 index = 2;
+    required uint64 op_id = 3;
+    required int64 rpc_id = 4;
+}
+
+message FsmState {
+    required AppliedIndex applied = 1;
+    required AppliedIndex ufs_applied = 2;
+}
+
+// Describe a snapshot.
+message SnapshotData {
+    // Snapshot id / applied index of the snapshot.
+    required uint64 snapshot_id = 1;
+
+    // Which node is the snapshot created.
+    required uint64 node_id = 2;
+
+    // Creation time
+    required uint64 create_time = 3;
+
+    optional bytes bytes_data = 4;
+
+    optional SnapshotFileList files_data = 5;
+
+    required FsmState fsm_state = 6;
+}
+
+
+message RaftPeerProto {
+    required uint64 node_id = 1;
+    required string hostname = 2;
+    required uint32 port = 3;
+}
+
+// Request this service to determine whether the current node is a leader.
+message PingRequest {
+
+}
+
+message PingResponse {
+    required uint64 leader_id = 1;
+    repeated RaftPeerProto group = 2;
+}
+
+//Cluster configuration changes.
+message ConfChangeRequest {
+    required eraftpb.ConfChange change = 1;
+}
+
+message ConfChangeResponse {
+}
+
+// User-defined log request.
+message ProposeRequest {
+    required bytes data = 1;
+    // Raft id of the master whose handler already applied this entry locally.
+    // Only a leader with this id may skip FSM apply; a forwarded entry from
+    // another node must be replayed.
+    optional uint64 proposer_id = 2;
+    // Metadata-restore epoch the proposer's handler saw when it mutated its
+    // FSM. The receiver skips replay only while its own epoch is unchanged: a
+    // snapshot restore in between discards that mutation, so the entry must be
+    // replayed then. Absent means the batch was never pre-applied.
+    optional uint64 proposer_epoch = 3;
+}
+
+message ProposeResponse {
+    optional uint64 applied_index = 1;
+}
+
+message RaftRequest {
+    required eraftpb.Message message = 1;
+    // Process incarnation, verified by a correlated heartbeat RPC response.
+    optional uint64 sender_session = 2;
+    // Fence append/snapshot payloads for an earlier receiver incarnation.
+    // A peer without a learned session may use legacy traffic. Once a session
+    // is learned, missing session fields cannot downgrade or clear the fence;
+    // mixed-version rollback then requires roll-forward or a leader process
+    // that has not learned the fenced session.
+    optional uint64 receiver_session = 3;
+    // The heartbeat commit itself is bounded by Progress.matched, not this value.
+    optional uint64 leader_commit = 4;
+}
+
+message RaftResponse {
+    // Transport handshake only, not an acknowledgement of replicated data.
+    optional uint64 session = 1;
+    // Leader accepts the session observation only in the queried term.
+    optional uint64 term = 2;
+    // The sender is intentionally rebuilding lost local state. This lets a
+    // leader distinguish a replacement from a healthy peer on first contact.
+    optional bool recovering = 3;
+}
+
+// Download snapshot request.
+message SnapshotDownloadRequest {
+    required string dir = 1;
+    required SnapshotFileInfo snapshot_file = 2;
+    required uint64 offset = 3;
+}
+
+// Snapshot read response, only returns after the end of a file reading.
+message SnapshotDownloadResponse {
+    required bool is_last = 1;
+    required uint64 checksum = 2;
+}
+
+message ReportSnapshotRequest {
+    required SnapshotData snapshot = 1;
+}
+
+message ReportSnapshotResponse {
+    required bool accepted = 1;
+}

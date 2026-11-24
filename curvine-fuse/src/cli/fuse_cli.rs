@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use curvine_common::conf::ClientConfCliOverrides;
-use curvine_common::version;
+use curvine_config::ClientConfCliOverrides;
+use curvine_sys::version;
 
 use crate::cli::mount_args::{FuseMountArgs, FuseRuntimeArgs};
 
@@ -41,6 +41,10 @@ pub struct ListConfigFlagsArgs {
     args_conflicts_with_subcommands = true
 )]
 pub struct FuseCli {
+    /// Print the component version in JSON format and exit
+    #[arg(long, global = true)]
+    pub version_json: bool,
+
     #[command(subcommand)]
     pub cmd: Option<FuseSubcommand>,
 
@@ -87,13 +91,30 @@ impl FuseCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_runtime::common::Utils;
+    use std::fs;
+
+    fn with_valid_conf<T>(extra_args: &[&str], test: impl FnOnce(FuseRuntimeArgs) -> T) -> T {
+        let conf_path = Utils::temp_file();
+        fs::write(&conf_path, "[fuse]\nio_threads = 1\n").expect("write test config");
+
+        let mut argv = vec!["curvine-fuse", "--conf", conf_path.as_str()];
+        argv.extend_from_slice(extra_args);
+        let args = FuseCli::try_parse_from(argv)
+            .expect("parse runtime arguments")
+            .resolve_runtime_args();
+        let result = test(args);
+
+        let _ = fs::remove_file(&conf_path);
+        result
+    }
 
     #[test]
     fn bare_invocation_preserves_top_level_flags() {
         let cli = FuseCli::try_parse_from(["curvine-fuse", "--io-threads", "4"]).unwrap();
         assert!(cli.cmd.is_none());
         let args = cli.resolve_runtime_args();
-        assert_eq!(args.mount.io_threads, Some(4));
+        assert_eq!(args.mount.fuse.io_threads, Some(4));
     }
 
     #[test]
@@ -143,51 +164,45 @@ mod tests {
 
     #[test]
     fn runtime_args_apply_client_overrides_to_conf() {
-        let args = FuseCli::try_parse_from(["curvine-fuse", "--client.io-threads", "12"])
-            .unwrap()
-            .resolve_runtime_args();
-        let conf = args.get_conf().unwrap();
-        assert_eq!(conf.client.io_threads, 12);
+        with_valid_conf(&["--client.io-threads", "12"], |args| {
+            let conf = args.get_conf().unwrap();
+            assert_eq!(conf.client.io_threads, 12);
+        });
     }
 
     #[test]
     fn mount_subcommand_preserves_flags() {
         let cli = FuseCli::try_parse_from(["curvine-fuse", "mount", "--io-threads", "8"]).unwrap();
         let args = cli.resolve_runtime_args();
-        assert_eq!(args.mount.io_threads, Some(8));
+        assert_eq!(args.mount.fuse.io_threads, Some(8));
     }
 
-    // Kill switch: FuseConf defaults metrics on (Phase 1–3 ship enabled).
     #[test]
     fn metrics_enabled_defaults_to_true() {
-        use curvine_common::conf::FuseConf;
+        use curvine_config::FuseConf;
         assert!(FuseConf::default().metrics_enabled);
     }
 
-    // Kill switch: `--metrics-enabled false` parses and overrides the conf to
-    // false (the production emergency-downgrade path).
     #[test]
     fn metrics_enabled_cli_override_disables() {
-        let args = FuseCli::try_parse_from(["curvine-fuse", "--metrics-enabled", "false"])
-            .unwrap()
-            .resolve_runtime_args();
-        assert_eq!(args.mount.metrics_enabled, Some(false));
-        let conf = args.get_conf().unwrap();
-        assert!(
-            !conf.fuse.metrics_enabled,
-            "--metrics-enabled false must disable metrics in the resolved conf"
-        );
+        with_valid_conf(&["--metrics-enabled", "false"], |args| {
+            assert_eq!(args.mount.fuse.metrics_enabled, Some(false));
+            let conf = args.get_conf().unwrap();
+            assert!(
+                !conf.fuse.metrics_enabled,
+                "--metrics-enabled false must disable metrics in the resolved conf"
+            );
+        });
     }
 
     // Kill switch: when the flag is absent the conf keeps its default (true).
     #[test]
     fn metrics_enabled_absent_keeps_default() {
-        let args = FuseCli::try_parse_from(["curvine-fuse", "--io-threads", "4"])
-            .unwrap()
-            .resolve_runtime_args();
-        assert_eq!(args.mount.metrics_enabled, None);
-        let conf = args.get_conf().unwrap();
-        assert!(conf.fuse.metrics_enabled, "absent flag keeps default true");
+        with_valid_conf(&["--io-threads", "4"], |args| {
+            assert_eq!(args.mount.fuse.metrics_enabled, None);
+            let conf = args.get_conf().unwrap();
+            assert!(conf.fuse.metrics_enabled, "absent flag keeps default true");
+        });
     }
 
     #[test]
@@ -195,6 +210,14 @@ mod tests {
         let err =
             FuseCli::try_parse_from(["curvine-fuse", "--io-threads", "4", "mount"]).unwrap_err();
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn version_json_parses_without_mount_args() {
+        let cli = FuseCli::try_parse_from(["curvine-fuse", "--version-json"]).unwrap();
+
+        assert!(cli.version_json);
+        assert!(cli.cmd.is_none());
     }
 
     #[test]

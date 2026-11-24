@@ -14,7 +14,6 @@
 
 package io.curvine;
 
-import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -36,6 +35,8 @@ public class FilesystemConf {
 
     public String read_chunk_size = "128KB";
     public int read_chunk_num = 8;
+    // Chunk requests kept in flight per remote block read; 1 sends one at a time.
+    public int read_pipeline_depth = 1;
     public int read_parallel = 1;
     public String read_slice_size = "0";
 
@@ -51,9 +52,9 @@ public class FilesystemConf {
     public long conn_retry_max_sleep_ms = 2 * 1000;
 
     // rpc requests retry policy.
-    public long rpc_retry_max_duration_ms = 120 * 1000;
+    public long rpc_retry_max_duration_ms = 60 * 1000;
     public long rpc_retry_min_sleep_ms = 100;
-    public long rpc_retry_max_sleep_ms = 10 * 1000;
+    public long rpc_retry_max_sleep_ms = 3 * 1000;
 
     // Whether to close the idle rpc connection.
     public boolean rpc_close_idle = true;
@@ -61,17 +62,24 @@ public class FilesystemConf {
     //Configuration of timeout for a request.
     public long conn_timeout_ms = 30 * 1000;
     public long rpc_timeout_ms = 120 * 1000;
-    public long data_timeout_ms = 120 * 1000;
+    // One fixed deadline for the data path, mirroring
+    // ClientConf::DEFAULT_DATA_TIMEOUT_MS (300s). The writer buffer handshake is
+    // bounded by it, and that handshake must outlast a Complete/Flush that drains
+    // the queued writes and then retries the master through a failover
+    // (rpc_timeout_ms + rpc_retry_max_duration_ms = 240s), otherwise a
+    // slow-but-healthy closeWriter is reported as failed (#1908).
+    public long data_timeout_ms = 300 * 1000;
 
     // Number of fs master connections.
-    public int master_conn_pool_size = 3;
+    // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
+    public int master_conn_pool_size = 1;
 
     // Whether to enable pre-reading, it only controls whether short-circuit read and write, and whether it is turned on.
     public boolean enable_read_ahead = true;
     public String read_ahead_len = "0";
     public String drop_cache_len = "1MB";
 
-    public String failed_worker_ttl = "10m";
+    public long failed_worker_ttl_ms = 10 * 60 * 1000;
 
     public boolean enable_unified_fs  = true;
 
@@ -81,19 +89,26 @@ public class FilesystemConf {
 
     public int umask = 022;
 
-    public String mount_update_ttl = "10s";
+    public long mount_update_ttl_ms = 10 * 1000;
 
-    public String sync_check_interval_min = "100ms";
+    public long sync_check_interval_min_ms = 100;
 
-    public String sync_check_interval_max = "1s";
+    public long sync_check_interval_max_ms = 1000;
 
-    public String max_sync_wait_timeout = "5m";
+    public long max_sync_wait_timeout_ms = 5 * 60 * 1000;
 
     public int sync_check_log_tick = 3;
 
+    // Transfer service routing. Endpoints are comma-separated host:port values.
+    // Transfer is always on: an empty endpoint list routes to the master's
+    // embedded transfer service, a non-empty one to a standalone transfer.
+    public String transfer_endpoints = "";
+    public int transfer_client_pending_queue_size = 1024;
+    public int transfer_client_submit_concurrency = 64;
+
     public boolean enable_block_conn_pool = true;
     public int block_conn_idle_size = 128;
-    public String block_conn_idle_time = "60s";
+    public long block_conn_idle_time_ms = 60 * 1000;
 
     public String small_file_size = "4MB";
 
@@ -130,6 +145,9 @@ public class FilesystemConf {
         }
 
         for(Field field : getClass().getDeclaredFields())  {
+            if (isTransferField(field)) {
+                continue;
+            }
             String key = String.format("%s.%s", PREFIX, field.getName());
             String value = conf.get(key);
 
@@ -138,10 +156,15 @@ public class FilesystemConf {
             }
 
             field.setAccessible(true);
+            value = value.trim();
             String fieldType = field.getType().getName();
             switch (fieldType) {
                 case "java.lang.String":
-                    field.set(this, value);
+                    if ("master_addrs".equals(field.getName())) {
+                        field.set(this, normalizeCsv(value));
+                    } else {
+                        field.set(this, value);
+                    }
                     break;
                 case "int":
                     field.setInt(this, Integer.parseInt(value));
@@ -156,13 +179,28 @@ public class FilesystemConf {
                     throw new RuntimeException("Unsupported Type: " + fieldType);
             }
         }
+
+        String transferEndpoints = conf.get(PREFIX + ".transfer.endpoints");
+        if (transferEndpoints != null) {
+            transfer_endpoints = normalizeCsv(transferEndpoints);
+        }
+        String transferClientPendingQueueSize =
+                conf.get(PREFIX + ".transfer.client_pending_queue_size");
+        if (transferClientPendingQueueSize != null) {
+            transfer_client_pending_queue_size = Integer.parseInt(transferClientPendingQueueSize.trim());
+        }
+        String transferClientSubmitConcurrency =
+                conf.get(PREFIX + ".transfer.client_submit_concurrency");
+        if (transferClientSubmitConcurrency != null) {
+            transfer_client_submit_concurrency = Integer.parseInt(transferClientSubmitConcurrency.trim());
+        }
     }
 
     public String toToml() throws IllegalAccessException {
         StringBuilder builder = new StringBuilder();
         for(Field field : getClass().getDeclaredFields()) {
             field.setAccessible(true);
-            if (Modifier.isStatic(field.getModifiers())) {
+            if (Modifier.isStatic(field.getModifiers()) || isTransferField(field)) {
                 continue;
             }
 
@@ -185,18 +223,77 @@ public class FilesystemConf {
             builder.append(String.format("%s = %s\n", field.getName(), value));
         }
 
+        builder.append("\n[transfer]\n");
+        builder.append("endpoints = [");
+        boolean first = true;
+        for (String endpoint : transfer_endpoints.split(",")) {
+            String trimmed = endpoint.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (!first) {
+                builder.append(", ");
+            }
+            builder.append('"').append(escapeTomlString(trimmed)).append('"');
+            first = false;
+        }
+        builder.append("]\n");
+        builder.append("client_pending_queue_size = ")
+                .append(transfer_client_pending_queue_size)
+                .append("\n");
+        builder.append("client_submit_concurrency = ")
+                .append(transfer_client_submit_concurrency)
+                .append("\n");
+
         return builder.toString();
+    }
+
+    private static boolean isTransferField(Field field) {
+        return "transfer_endpoints".equals(field.getName())
+                || "transfer_client_pending_queue_size".equals(field.getName())
+                || "transfer_client_submit_concurrency".equals(field.getName());
+    }
+
+    private static String escapeTomlString(String value) {
+        return value.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t");
+    }
+
+    static String normalizeCsv(String value) {
+        StringBuilder builder = new StringBuilder();
+        for (String part : value.split(",")) {
+            String trimmed = part.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(',');
+            }
+            builder.append(trimmed);
+        }
+        return builder.toString();
+    }
+
+    static String trimEnvHostname(String hostname) {
+        if (hostname == null) {
+            return null;
+        }
+        String trimmed = hostname.trim();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 
     private String getClientHostname() {
         // In the k8s environment, POD_IP is used by default as client hostname
-        String hostname = System.getenv("POD_IP");
-        if (StringUtils.isEmpty(hostname)) {
+        String hostname = trimEnvHostname(System.getenv("POD_IP"));
+        if (hostname == null) {
             // Use CURVINE_CLIENT_HOSTNAME environment variable.
-            hostname = System.getenv(HOSTNAME_KEY);
+            hostname = trimEnvHostname(System.getenv(HOSTNAME_KEY));
         }
 
-        if (StringUtils.isNotEmpty(hostname)) {
+        if (hostname != null) {
             return hostname;
         } else {
             try {
@@ -222,6 +319,7 @@ public class FilesystemConf {
                 ", write_chunk_num=" + write_chunk_num +
                 ", read_chunk_size='" + read_chunk_size + '\'' +
                 ", read_chunk_num=" + read_chunk_num +
+                ", read_pipeline_depth=" + read_pipeline_depth +
                 ", read_parallel=" + read_parallel +
                 ", read_slice_size='" + read_slice_size + '\'' +
                 ", max_cache_block_handles=" + max_cache_block_handles +
@@ -242,19 +340,20 @@ public class FilesystemConf {
                 ", enable_read_ahead=" + enable_read_ahead +
                 ", read_ahead_len='" + read_ahead_len + '\'' +
                 ", drop_cache_len='" + drop_cache_len + '\'' +
-                ", failed_worker_ttl='" + failed_worker_ttl + '\'' +
+                ", failed_worker_ttl_ms=" + failed_worker_ttl_ms +
                 ", enable_unified_fs=" + enable_unified_fs +
                 ", enable_read_ufs=" + enable_rust_read_ufs +
                 ", enable_fallback_read_ufs=" + enable_fallback_read_ufs +
                 ", umask=" + umask +
-                ", mount_update_ttl='" + mount_update_ttl + '\'' +
-                ", sync_check_interval_min='" + sync_check_interval_min + '\'' +
-                ", sync_check_interval_max='" + sync_check_interval_max + '\'' +
-                ", max_sync_wait_timeout='" + max_sync_wait_timeout + '\'' +
+                ", mount_update_ttl_ms=" + mount_update_ttl_ms +
+                ", sync_check_interval_min_ms=" + sync_check_interval_min_ms +
+                ", sync_check_interval_max_ms=" + sync_check_interval_max_ms +
+                ", max_sync_wait_timeout_ms=" + max_sync_wait_timeout_ms +
                 ", sync_check_log_tick=" + sync_check_log_tick +
+                ", transfer_endpoints='" + transfer_endpoints + '\'' +
                 ", enable_block_conn_pool=" + enable_block_conn_pool +
                 ", block_conn_idle_size=" + block_conn_idle_size +
-                ", block_conn_idle_time='" + block_conn_idle_time + '\'' +
+                ", block_conn_idle_time_ms=" + block_conn_idle_time_ms +
                 ", small_file_size='" + small_file_size + '\'' +
                 ", enable_smart_prefetch=" + enable_smart_prefetch +
                 ", large_file_size='" + large_file_size + '\'' +

@@ -1,5 +1,5 @@
 # ============================================================
-# EPEL + CRB (shared by spdk-deps and spdk-full)
+# EPEL + CRB (runtime base)
 # ============================================================
 FROM rockylinux:9 AS epel-base
 
@@ -21,86 +21,12 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     && dnf clean all
 
 # ============================================================
-# Stage 0: Install dependencies & clone SPDK
+# SPDK artifacts come from the compile image
 # ============================================================
-FROM epel-base AS spdk-deps
-
-ARG SPDK_VERSION=v25.09
-ARG NASM_VERSION=2.16.03
-ARG ISAL_VERSION=v2.31.1
-
-RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
-    dnf install -y git && \
-    dnf clean all
-
-# Clone SPDK
-RUN git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git /spdk
-WORKDIR /spdk
-RUN git submodule update --init --depth 1
-
-# Install SPDK build deps
-RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
-    dnf config-manager --set-disabled devel 2>/dev/null || true && \
-    scripts/pkgdep.sh --rdma && \
-    dnf clean all
-
-# Build nasm from source (needed by ISA-L, not available in EPEL 9 for aarch64)
-RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
-    tar -xz -C /tmp && \
-    cd /tmp/nasm-$NASM_VERSION && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    rm -rf /tmp/nasm-$NASM_VERSION
-
-# Build isa-l from source (needed by SPDK, not available in all Rocky 9 arches)
-RUN cd /tmp && \
-    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
-    cd isa-l-src && \
-    ./autogen.sh && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
-    cd / && rm -rf /tmp/isa-l-src
+FROM ghcr.io/curvineio/curvine-compile:rocky9 AS spdk-artifacts
 
 # ============================================================
-# Stage 1: Build SPDK
-# ============================================================
-FROM spdk-deps AS spdk-build
-
-ARG SPDK_VERSION
-WORKDIR /spdk
-
-RUN ./configure \
-    --disable-tests \
-    --with-rdma \
-    --without-vfio-user \
-    --target-arch=native \
-    --with-shared && \
-    make -j$(nproc) && \
-    mkdir -p /opt/spdk/build/bin \
-             /opt/spdk/build/lib \
-             /opt/spdk/dpdk/build/lib \
-             /opt/spdk/include/spdk \
-             /opt/spdk/dpdk/build/include \
-             /opt/spdk/isa-l/.libs \
-             /opt/spdk/isa-l-crypto/.libs && \
-    cp build/bin/nvmf_tgt /opt/spdk/build/bin/ && \
-    cp build/lib/libspdk*.so* /opt/spdk/build/lib/ && \
-    cp build/lib/libspdk*.a /opt/spdk/build/lib/ && \
-    cp dpdk/build/lib/librte_*.so* /opt/spdk/dpdk/build/lib/ && \
-    cp dpdk/build/lib/librte_*.a /opt/spdk/dpdk/build/lib/ && \
-    cp -r include/spdk/*.h /opt/spdk/include/spdk/ && \
-    cp -r dpdk/build/include/* /opt/spdk/dpdk/build/include/ && \
-    cp -r scripts /opt/spdk/scripts && \
-    cp -r python /opt/spdk/python && \
-    cp isa-l/.libs/libisal* /opt/spdk/isa-l/.libs/ && \
-    cp isa-l-crypto/.libs/libisal* /opt/spdk/isa-l-crypto/.libs/ && \
-    ldconfig
-
-# ============================================================
-# Stage 2: Full runtime for NVMe-oF Target nodes
+# Full runtime for NVMe-oF Target nodes
 # ============================================================
 FROM runtime-base AS spdk-full
 
@@ -109,7 +35,7 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     ncurses-libs kmod pciutils libffi fuse3-libs \
     && dnf clean all
 
-COPY --from=spdk-build /opt/spdk /opt/spdk
+COPY --from=spdk-artifacts /opt/spdk /opt/spdk
 
 RUN ldconfig && \
     mkdir -p /var/log/spdk /var/run/spdk
@@ -143,6 +69,14 @@ ARG REPO_URL=https://github.com/curvineio/curvine
 LABEL org.opencontainers.image.source="${REPO_URL}"
 LABEL org.opencontainers.image.description="Curvine Native Kubernetes Runtime Image"
 
+# BUILD_VERSION drives the version reported by binaries and the build-version
+# file inside the image. It is set by the release CI from the git tag (vX.Y.Z
+# -> X.Y.Z); local image builds leave it empty and fall back to the workspace
+# version / git describe.
+ARG BUILD_VERSION
+ENV BUILD_VERSION=${BUILD_VERSION}
+LABEL org.opencontainers.image.version="${BUILD_VERSION}"
+
 # Override ENTRYPOINT to ensure RUN commands execute correctly
 # The compile image has ENTRYPOINT ["/bin/bash", "-c"] which can interfere with RUN
 ENTRYPOINT []
@@ -151,7 +85,7 @@ ENTRYPOINT []
 # Examples:
 #   -p core --ufs opendal-s3 --spdk-rdma                   # Core + S3 + SPDK-RDMA
 #   -p server -p client -p tests --ufs opendal-s3 --spdk   # Bench + SPDK-TCP only
-ARG BUILD_ARGS="--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs --spdk-rdma"
+ARG BUILD_ARGS="-p server -p client -p cli -p fuse -p web --skip-java-sdk --skip-python-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs --spdk-rdma"
 
 # Copy and apply build configurations
 COPY curvine-docker/deploy/config /build-config/config
@@ -165,49 +99,18 @@ ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 COPY . /workspace/
 WORKDIR /workspace
 
-# Copy SPDK build artifacts for NVMe-oF initiator support
-COPY --from=spdk-build /opt/spdk /opt/spdk
+# SPDK build artifacts are provided by the compile image.
 ENV SPDK_DIR=/opt/spdk
 ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
 
-# Install SPDK linking dependencies (static .a libs)
-RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
-    dnf install -y epel-release && \
-    dnf install -y numactl-devel libuuid-devel rdma-core-devel \
-    libibverbs-devel librdmacm-devel && \
-    cp /opt/spdk/isa-l/.libs/*.so* /usr/lib64/ && \
-    cp /opt/spdk/isa-l-crypto/.libs/*.so* /usr/lib64/ && \
-    ldconfig
-
-# 6. Pre-install WebUI dependencies and fix vue-cli-service module resolution
-RUN if [ -d "/workspace/curvine-web/webui" ]; then \
-        echo "Pre-installing WebUI dependencies..."; \
-        cd /workspace/curvine-web/webui && \
-        npm install --legacy-peer-deps && \
-        echo "npm install completed" && \
-        # Fix: vue-cli-service wrapper script expects node_modules/package.json
-        # Create symlink to @vue/cli-service/package.json
-        ln -s @vue/cli-service/package.json node_modules/package.json && \
-        echo "Created symlink: node_modules/package.json -> @vue/cli-service/package.json" && \
-        ls -la node_modules/package.json; \
-    fi
-
-# 7. Patch build.sh to use direct vue-cli-service.js call
-RUN if [ -f "/workspace/build/build.sh" ]; then \
-        echo "Patching build.sh to fix vue-cli-service wrapper script issue..."; \
-        sed -i 's/npm run build/node node_modules\/@vue\/cli-service\/bin\/vue-cli-service.js build/g' /workspace/build/build.sh && \
-        echo "Patch applied" && \
-        grep -n "vue-cli-service" /workspace/build/build.sh || true; \
-    fi
-
-# 8. Build the project from source
+# 6. Build the runtime project from source.
 RUN echo "Building Curvine from source..." && \
     export CURVINE_HOME=/workspace && \
     # Use workspace tmp directory instead of /tmp to avoid "no space left on device"
     mkdir -p /workspace/tmp && \
     export TMPDIR=/workspace/tmp && \
     echo "Using TMPDIR=$TMPDIR for compilation temporary files" && \
-    echo "Running 'make all --skip-java-sdk' with retry mechanism..." && \
+    echo "Running runtime build with retry mechanism: make all ARGS=\"${BUILD_ARGS}\"" && \
     # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
@@ -232,9 +135,13 @@ RUN echo "Building Curvine from source..." && \
     rm -rf /workspace/tmp
 
 # 9. Create output directory and copy build artifacts from build/dist
+ARG GIT_VERSION=unknown
 RUN mkdir -p /build-output && \
     echo "Copying build/dist contents to /build-output..." && \
     cp -r /workspace/build/dist/* /build-output/ && \
+    if [ -f "/build-output/build-version" ]; then \
+        sed -i "s/^commit=.*/commit=${GIT_VERSION}/" /build-output/build-version; \
+    fi && \
     # Verify critical files exist
     if [ ! -f "/build-output/bin/launch-process.sh" ]; then \
         echo "✗ ERROR: launch-process.sh not found in build/dist/bin" && \
@@ -252,14 +159,22 @@ RUN mkdir -p /build-output && \
 # Runtime stage
 FROM runtime-base AS runtime
 
+ARG BUILD_VERSION
+LABEL org.opencontainers.image.version="${BUILD_VERSION}"
+
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf install -y --allowerasing \
     fuse3 zlib libstdc++ nvme-cli \
     && dnf clean all && rm -rf /var/cache/dnf/*
 
-# Copy ISA-L shared libs for SPDK initiator (built from source, not in EPEL)
-COPY --from=spdk-build /opt/spdk/isa-l/.libs/libisal* /usr/lib64/
-COPY --from=spdk-build /opt/spdk/isa-l-crypto/.libs/libisal* /usr/lib64/
+# Copy ISA-L shared libs for SPDK initiator (built into the compile image)
+COPY --from=builder /opt/spdk/isa-l/.libs/libisal* /usr/lib64/
+COPY --from=builder /opt/spdk/isa-l-crypto/.libs/libisal* /usr/lib64/
+RUN ldconfig
+
+# Copy FoundationDB client library (curvine-server links libfdb_c for the
+# FDB KV backend; installed in the compile image's /usr/lib64)
+COPY --from=builder /usr/lib64/libfdb_c.so /usr/lib64/
 RUN ldconfig
 
 # Copy JindoSDK from builder stage for OSS-HDFS support
@@ -281,11 +196,18 @@ COPY --from=builder /build-output/ /app/curvine/
 
 # Copy entrypoint script
 COPY curvine-docker/deploy/entrypoint.sh /entrypoint.sh
+COPY curvine-docker/fluid/entrypoint.sh /fluid-entrypoint.sh
+COPY curvine-docker/fluid/generate_config.py /app/curvine/generate_config.py
+COPY curvine-docker/fluid/config-parse.py /app/curvine/config-parse.py
+COPY curvine-docker/fluid/mountUfs.sh /app/curvine/mountUfs.sh
+COPY curvine-docker/fluid/reportSummary.sh /app/curvine/reportSummary.sh
 
 # Make all binaries and scripts executable
 RUN find /app/curvine -type f -name "*.sh" -exec chmod +x {} \; \
     && find /app/curvine -type f -path "*/bin/*" -exec chmod +x {} \; \
     && find /app/curvine -type f -path "*/lib/*" -exec chmod +x {} \; \
+    && chmod +x /app/curvine/generate_config.py /app/curvine/config-parse.py /app/curvine/mountUfs.sh /app/curvine/reportSummary.sh \
+    && chmod +x /fluid-entrypoint.sh \
     && chmod +x /entrypoint.sh
 
 # Set environment variables
@@ -294,8 +216,9 @@ ENV CURVINE_HOME=/app/curvine
 ENV PATH=$PATH:$CURVINE_HOME/bin
 
 # Override environment settings for container
+# CURVINE_CONF_FILE is resolved by deploy/entrypoint.sh so that
+# CURVINE_CONF_DIR / CURVINE_CONF_FILE overrides work at runtime.
 ENV ORPC_BIND_HOSTNAME=0.0.0.0
-ENV CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
 
 WORKDIR $APP_HOME
 
@@ -305,7 +228,9 @@ WORKDIR $APP_HOME
 # 8997: Worker RPC
 # 9000: Master Web UI
 # 9001: Worker Web UI / Master Web1
-EXPOSE 8995 8996 8997 9000 9001
+# 9010: Transfer RPC
+# 9011: Transfer Web UI
+EXPOSE 8995 8996 8997 9000 9001 9010 9011
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["master", "start"]

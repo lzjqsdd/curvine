@@ -18,8 +18,35 @@
 
 set -euo pipefail
 
+FLUID_RUNTIME_CONFIG_PATH="${FLUID_RUNTIME_CONFIG_PATH:-/etc/fluid/config/config.json}"
+FLUID_RUNTIME_TYPE="${FLUID_RUNTIME_TYPE:-}"
+FLUID_RUNTIME_COMPONENT_TYPE="${FLUID_RUNTIME_COMPONENT_TYPE:-}"
+
+is_fluid_mode() {
+  case "${1:-}" in
+    fluid-thin-runtime)
+      return 0
+      ;;
+  esac
+
+  if [[ -n "${FLUID_RUNTIME_TYPE}" || -n "${FLUID_RUNTIME_COMPONENT_TYPE}" ]]; then
+    return 0
+  fi
+
+  [[ -f "${FLUID_RUNTIME_CONFIG_PATH}" ]]
+}
+
+if is_fluid_mode "${1:-}"; then
+  if [[ ! -x /fluid-entrypoint.sh ]]; then
+    echo "Fluid runtime mode detected, but /fluid-entrypoint.sh is missing or not executable"
+    exit 1
+  fi
+
+  exec /fluid-entrypoint.sh "$@"
+fi
+
 # Start the curvine service process
-# Service type: master, worker
+# Service type: master, worker, mds, transfer
 SERVER_TYPE=${1:-master}
 
 # Operation type: start, stop, restart
@@ -40,11 +67,14 @@ set_hosts() {
 start_service() {
   local SERVICE_NAME=$1
 
-  if [ -z "$CURVINE_CONF_FILE" ]; then
-    export CURVINE_CONF_FILE=${CURVINE_HOME}/conf/curvine-cluster.toml
+  # Unset-safe check: this script runs under `set -u` and the images no
+  # longer preset CURVINE_CONF_FILE, so it may be undefined here. An
+  # explicitly supplied CURVINE_CONF_FILE keeps precedence.
+  if [ -z "${CURVINE_CONF_FILE:-}" ]; then
+    export CURVINE_CONF_FILE=${CURVINE_CONF_DIR:-${CURVINE_HOME}/conf}/curvine-cluster.toml
   fi
 
-  local LOG_DIR=${CURVINE_HOME}/logs
+  local LOG_DIR=${CURVINE_LOG_DIR:-${CURVINE_HOME}/logs}
   local OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
   mkdir -p "${LOG_DIR}"
 
@@ -151,7 +181,7 @@ restart_service() {
 set_hosts
 
 case "$SERVER_TYPE" in
-  (master|worker)
+  (master|worker|mds|transfer)
     case "$ACTION_TYPE" in
       start)
         start_service "$SERVER_TYPE"
@@ -178,4 +208,3 @@ case "$SERVER_TYPE" in
     exec "$@"
     ;;
 esac
-

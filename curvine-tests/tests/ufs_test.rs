@@ -58,14 +58,23 @@
 //! export UFS_TEST_PATH=hdfs://namenode:9870/test
 //! export UFS_TEST_PROPERTIES="webhdfs.endpoint=http://namenode:9870,webhdfs.root=/,webhdfs.delegation=token"
 //! ```
+//!
+//! #### COSN (Tencent COS via libhdfs + hadoop-cos):
+//! ```bash
+//! # Build with: make build ARGS='--ufs cosn'
+//! export UFS_TEST_PATH=cosn://mybucket-1250000000/ufs-test
+//! export UFS_TEST_PROPERTIES="cosn.secretId=xxx,cosn.secretKey=yyy,cosn.region=ap-guangzhou"
+//! # Hadoop keys (fs.cosn.*) are also accepted.
+//! # Dedicated COSN cases (multi-cred mount, large I/O, rename): see cosn_ufs_test.rs
+//! ```
 
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{ListOptions, MountOptions, WriteType};
+use curvine_core_error::CommonResult;
+use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+use curvine_model::{ListOptions, MountOptions, WriteType};
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_tests::Testing;
 use futures::StreamExt;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -111,7 +120,7 @@ fn ufs_test() -> CommonResult<()> {
     if std::env::var("UFS_TEST_PATH").is_err() {
         println!("⚠️  UFS_TEST_PATH is not set, skipping test");
         println!("   Set UFS_TEST_PATH environment variable to run this test");
-        println!("   Example: export UFS_TEST_PATH=hdfs://192.168.108.129:9000/hdfs-test");
+        println!("   Example: export UFS_TEST_PATH=hdfs://192.0.2.129:9000/hdfs-test");
         return Ok(());
     }
 
